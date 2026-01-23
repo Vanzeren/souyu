@@ -1,0 +1,15 @@
+package com.souyu.forum;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.context.annotation.ComponentScan;
+
+@SpringBootApplication
+@ComponentScan(
+        basePackages = {"com.souyu.forum", "com.souyu.common.client"}
+)
+public class ForumEngineApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ForumEngineApplication.class, args);
+    }
+}

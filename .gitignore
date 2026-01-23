@@ -1,0 +1,30 @@
+# Maven
+target/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Spring Boot
+.mvn/
+mvnw
+mvnw.cmd
+
+# Logs
+logs/
+*.log
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Configuration files (sensitive data)
+**/application.yml
+**/application.properties
+**/application-*.yml
+**/application-*.properties
+config/
