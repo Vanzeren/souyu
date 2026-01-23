@@ -181,18 +181,3 @@ sequenceDiagram
   - **消息中间件**: 利用 Stream 数据结构实现轻量级消息队列。
   - **原子计数器**: 使用 `AtomicLong` 跟踪任务进度和并发数。
 
-## 📝 快速开始
-
-1. **环境准备**:
-   - JDK 17+
-   - Maven 3.8+
-   - 运行中的 Redis, MongoDB 实例。
-   - 配置 OpenAI, Tavily, Bocha 等 API Key。
-
-2. **构建项目**:
-   ```bash
-   mvn clean install
-   ```
-
-3. **运行**:
-   进入特定引擎目录（如 `query-engine`），运行 Spring Boot 应用程序。
