@@ -23,23 +23,23 @@ public class MediaAgentController {
     }
 
     @PostMapping()
-    public com.souyu.dto.QueryResponse handleQuery(@RequestBody Map<String,String> request) {
+    public com.souyu.common.dto.QueryResponse handleQuery(@RequestBody Map<String,String> request) {
         String query = request.get("query");
         String taskId = request.getOrDefault("taskId","");
         logger.info("Query request:{}", query);
         taskId = mediaService.getAiResponse(taskId,query);
-        return new com.souyu.dto.QueryResponse(taskId);
+        return new com.souyu.common.dto.QueryResponse(taskId);
     }
 
     @GetMapping("/status")
-    public com.souyu.dto.QueryResponse status(@RequestParam String taskId){
+    public com.souyu.common.dto.QueryResponse status(@RequestParam String taskId){
         logger.info("获取任务状态，taskId：{}" ,taskId);
-        return new com.souyu.dto.QueryResponse(mediaService.getStatus(taskId));
+        return new com.souyu.common.dto.QueryResponse(mediaService.getStatus(taskId));
     }
 
     @GetMapping("/result")
-    public com.souyu.dto.QueryResponse result(@RequestParam String taskId){
+    public com.souyu.common.dto.QueryResponse result(@RequestParam String taskId){
         logger.info("获取任务结果，taskId：{}" ,taskId);
-        return new com.souyu.dto.QueryResponse(mediaService.getResult(taskId));
+        return new com.souyu.common.dto.QueryResponse(mediaService.getResult(taskId));
     }
 }

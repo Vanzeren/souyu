@@ -1,4 +1,4 @@
-package com.souyu.dto;
+package com.souyu.common.dto;
 
 import lombok.Data;
 import lombok.NoArgsConstructor;

@@ -22,7 +22,6 @@
 
     <modules>
         <module>query-engine</module>
-        <module>shared-dto</module>
         <module>common</module>
         <module>media-engine</module>
         <module>report-engine</module>

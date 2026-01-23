@@ -1,6 +1,6 @@
 package com.souyu.queryengine.controller;
 
-import com.souyu.dto.QueryResponse;
+import com.souyu.common.dto.QueryResponse;
 import com.souyu.queryengine.service.QueryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
