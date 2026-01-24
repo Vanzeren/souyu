@@ -6,7 +6,7 @@ import org.springframework.context.annotation.ComponentScan;
 
 @SpringBootApplication
 @ComponentScan(
-        basePackages = {"com.souyu.forum", "com.souyu.common.client"}
+        basePackages = {"com.souyu.forum", "com.souyu.common.client","com.souyu.common.TaskStatus","com.souyu.common.manager"}
 )
 public class ForumEngineApplication {
     public static void main(String[] args) {

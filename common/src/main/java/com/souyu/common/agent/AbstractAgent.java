@@ -1,6 +1,8 @@
 package com.souyu.common.agent;
 
+import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.client.TimeContextChatClient;
+import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.node.querynode.*;
 import com.souyu.common.producer.messageProducer;
 import com.souyu.common.state.Paragraph;
@@ -70,6 +72,9 @@ public abstract class AbstractAgent<R, C> {
 
     @Autowired
     private StateManager stateManager;
+    
+    @Autowired
+    private TaskStatusManager taskStatusManager; // 注入新的状态管理器
 
     @Autowired
     private messageProducer producer;
@@ -115,6 +120,9 @@ public abstract class AbstractAgent<R, C> {
 
             //标记报告已完成
             producer.triggerMasterReport(taskId);
+            
+            // 更新 TaskStatus 为 COMPLETED
+            taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.COMPLETED);
 
             logger.info("\n============================================================");
             logger.info("深度研究完成！");
@@ -123,6 +131,8 @@ public abstract class AbstractAgent<R, C> {
         } catch (Exception e) {
             logger.error("深度研究过程中发生错误: {}", e.getMessage(), e);
             stateManager.markTaskFailed(taskId, e.getMessage());
+            // 更新 TaskStatus 为 FAILED
+            taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.FAILED);
         }
     }
 

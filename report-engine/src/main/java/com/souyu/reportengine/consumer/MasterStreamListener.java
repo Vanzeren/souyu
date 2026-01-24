@@ -2,8 +2,10 @@ package com.souyu.reportengine.consumer;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.manager.ReportDocument;
 import com.souyu.common.manager.StateDocument;
+import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.reportengine.angent.ReportAgent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,6 +35,9 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
 
     @Autowired
     private ReportAgent reportAgent;
+    
+    @Autowired
+    private TaskStatusManager taskStatusManager; // 注入状态管理器
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -46,6 +51,9 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
 
 //        if ("0".equals(countStr)) {
             logger.info("Master 收到所有通知，开始为任务 " + taskId + " 生成最终报告...");
+            
+            // 更新主状态为 GENERATING
+            taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.GENERATING);
 
             try {
                 // 1. 获取所有必要数据
@@ -73,16 +81,17 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
                 saveGeneratedReport(taskId, reportResult);
 
                 // 4. 更新任务状态为完成
-                updateTaskStatus(taskId, "completed", reportResult.get("report_id").toString());
+                String reportId = reportResult.get("report_id").toString();
+                taskStatusManager.markTaskCompleted(taskId, reportId);
 
-                logger.info("任务 " + taskId + " 报告生成完成，报告ID: " + reportResult.get("report_id"));
+                logger.info("任务 " + taskId + " 报告生成完成，报告ID: " + reportId);
 
             } catch (Exception e) {
                 logger.error("生成报告失败: " + e.getMessage());
                 e.printStackTrace();
 
                 // 更新任务状态为失败
-                updateTaskStatus(taskId, "failed", e.getMessage());
+                taskStatusManager.markTaskFailed(taskId, e.getMessage());
             } finally {
                 // 处理完后清理 Redis 数据
                 redisTemplate.delete("task:count:" + taskId);
@@ -138,36 +147,6 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
         } catch (Exception e) {
             System.err.println("保存报告到 MongoDB 失败: " + e.getMessage());
             throw e;
-        }
-    }
-
-    /**
-     * 更新任务状态
-     */
-    private void updateTaskStatus(String taskId, String status, String message) {
-        try {
-            // 这里我们可能需要一个新的 TaskStatusDocument 类，或者复用 TaskMetadata 如果合适
-            // 但考虑到 TaskMetadata 主要是 Redis 用的，这里我们还是用 Document 或者新建一个类
-            // 为了简单起见，这里还是用 Document，或者你可以新建一个 TaskStatusDocument
-            // 既然你让我把 StateManager 中的类提出来，那我就假设你希望尽量用强类型
-            // 不过 TaskStatus 在 StateManager 里没有对应的内部类，所以我还是用 Document 保持原样，或者你可以指示我新建一个
-            // 既然你只说了那几个数据类，我就只改那几个。
-            
-            // 但是为了保持一致性，我可以用 TaskMetadata 如果它符合结构，但 TaskMetadata 没有 updatedAt
-            // 所以还是用 Document 比较灵活，或者新建一个类。
-            // 既然你没让我新建 TaskStatus 类，我就保留 Document 的用法，但是尽量规范化。
-            
-            org.bson.Document taskStatus = new org.bson.Document();
-            taskStatus.put("taskId", taskId);
-            taskStatus.put("status", status);
-            taskStatus.put("message", message);
-            taskStatus.put("updatedAt", new java.util.Date());
-
-            mongoTemplate.save(taskStatus, "task_status");
-
-            System.out.println("任务状态更新: " + taskId + " -> " + status);
-        } catch (Exception e) {
-            System.err.println("更新任务状态失败: " + e.getMessage());
         }
     }
 }

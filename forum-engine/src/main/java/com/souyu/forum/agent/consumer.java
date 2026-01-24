@@ -1,5 +1,7 @@
 package com.souyu.forum.agent;
 
+import com.souyu.common.TaskStatus.TaskStatus;
+import com.souyu.common.manager.TaskStatusManager;
 import jakarta.el.ExpressionFactory;
 import lombok.Data;
 import org.redisson.api.RAtomicLong;
@@ -44,6 +46,9 @@ public class consumer implements InitializingBean, DisposableBean {
     private report reportService;
     @Autowired
     private RedissonClient redissonClient;
+    
+    @Autowired
+    private TaskStatusManager taskStatusManager; // 注入状态管理器
 
     private final String LOCK_PREFIX="souyu:forum:lock:";
     private final String streamKey = "forum";
@@ -206,15 +211,26 @@ public class consumer implements InitializingBean, DisposableBean {
                 } else {
                     logger.info("Last log is NOT HOST for task {}, triggering summary.", taskId);
                     // 如果最后一条不是 HOST，说明还有未总结的内容，强制总结
+                    
+                    // 更新 Forum 状态为 RUNNING
+                    taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
+                    
                     String summary = reportService.generateHostSpeech(taskId);
                     if (summary != null) {
                         saveSummaryToMongo(taskId, summary);
+                        
+                        // 更新 Forum 状态为 COMPLETED
+                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                        
                         // 总结完后再减
                         RAtomicLong atomicCount = redissonClient.getAtomicLong("task:count:" + taskId);
                         long remaining = atomicCount.decrementAndGet();
                          if (remaining == 0) {
                             sendFinishedSignal(taskId);
                         }
+                    } else {
+                        // 如果生成失败，标记为 FAILED
+                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.FAILED);
                     }
                 }
 
@@ -276,9 +292,16 @@ public class consumer implements InitializingBean, DisposableBean {
                 if (result != null && result == 1) {
                     // 在生成总结前，先检查最后一条是否已经是 HOST，避免重复总结
                     if (!checkLastIsHost(taskId)) {
+                        // 更新 Forum 状态为 RUNNING
+                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
+                        
                         String summary = reportService.generateHostSpeech(taskId);
                         if (summary != null) {
                             saveSummaryToMongo(taskId, summary);
+                            // 更新 Forum 状态为 COMPLETED
+                            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                        } else {
+                             taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.FAILED);
                         }
                     } else {
                         logger.info("Last log is already HOST, skipping summary generation for task: {}", taskId);
