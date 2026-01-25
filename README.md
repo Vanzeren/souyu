@@ -16,7 +16,7 @@ Souyu 是一个基于现代 Java 技术栈构建的综合性分布式系统，�
 - **RPC 框架**: Spring Cloud OpenFeign
 
 ## 📊 系统架构图
-###任务执行时序流 (状态机驱动)
+### 任务执行时序流 (状态机驱动)
 ```mermaid
 sequenceDiagram
     participant User
