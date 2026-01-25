@@ -54,6 +54,11 @@ public class TaskStatus {
      * 错误信息（如果有）
      */
     private String errorMessage;
+    
+    /**
+     * 重试次数
+     */
+    private int retryCount = 0;
 
     /**
      * 任务整体状态枚举
@@ -88,5 +93,9 @@ public class TaskStatus {
     public TaskStatus(String taskId) {
         this();
         this.taskId = taskId;
+    }
+    
+    public void incrementRetryCount() {
+        this.retryCount++;
     }
 }

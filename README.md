@@ -12,11 +12,11 @@ Souyu 是一个基于现代 Java 技术栈构建的综合性分布式系统，�
   - MongoDB (Spring Data MongoDB)
 - **分布式协调**: Redisson (分布式锁)
 - **构建工具**: Maven
-- **消息队列**: Redis Stream
+- **消息队列**: Redis Stream, Redis Pub/Sub
 - **RPC 框架**: Spring Cloud OpenFeign
 
 ## 📊 系统架构图
-### 1. 任务执行时序流 (状态机驱动)
+###任务执行时序流 (状态机驱动)
 ```mermaid
 sequenceDiagram
     participant User
@@ -71,7 +71,8 @@ sequenceDiagram
   - **状态机管理**: 维护任务状态 (`TaskStatus`)，从 `RESEARCHING` -> `SUMMARIZING` -> `GENERATING` -> `COMPLETED`。
   - **事件驱动**: 监听 Redis Stream (`task:events:stream`)，响应 Worker 和 Forum 的完成事件。
   - **任务分发**: 通过 OpenFeign 向下游 Worker 发送指令，通过 Redis Stream 向 Report Engine 发送生成请求。
-- **技术**: Spring Boot, Redis Stream, Redisson, OpenFeign。
+  - **超时兜底**: `TaskTimeoutMonitor` 定时扫描卡死任务，执行重试或降级策略。
+- **技术**: Spring Boot, Redis Stream, Redisson, OpenFeign, Scheduled Task。
 
 ### 2. 查询引擎 (`query-engine`)
 负责处理搜索和查询任务，集成了 Tavily 搜索 API。
@@ -116,8 +117,9 @@ sequenceDiagram
 - **技术**: MongoDB, Redis Stream, Redisson, Lua。
 
 ### 6. 公共模块 (`common`)
-- **`AbstractAgent`**: 定义了 Agent 的通用行为（搜索工具执行、结果提取、Prompt 管理），`QueryAgent` 和 `BochaAgent` 均继承自此基类。
+- **`AbstractAgent`**: 定义了 Agent 的通用行为（搜索、反思、事件发送、**任务取消响应**）。
 - **`TaskStatusManager`**: 封装了基于 MongoDB 和 Redisson 的状态机逻辑。
+- **`TaskControlManager`**: 基于 Redis Pub/Sub 实现任务取消指令的广播与接收。
 - **`messageProducer`**: 统一的消息发送组件。
 
 ## 🚀 核心实现思路
@@ -161,7 +163,42 @@ sequenceDiagram
 - **Master -> Report**: Master 通过发送消息到 `task:report:request` Stream 触发报告生成（解决 Feign 超时问题）。
 - **Report -> Master**: Report Engine 完成后，发送 `REPORT_COMPLETED` 事件。
 
-### 4. 分布式一致性
+### 4. 鲁棒性设计 (Robustness)
+
+#### A. 超时兜底 (Timeout Recovery)
+Orchestrator 的 `TaskTimeoutMonitor` 组件通过 `@Scheduled` 定时任务（每分钟）扫描 MongoDB 中长时间未更新的任务，并根据当前状态执行恢复策略：
+
+- **RESEARCHING 阶段超时**:
+  - **检测**: 任务状态为 `RESEARCHING` 且 `updatedAt` 超过 10 分钟。
+  - **策略**: 检查 `workerStatus`，识别未完成的 Worker（如 `QueryEngine`）。
+  - **操作**: 重新调用 RPC 接口触发该 Worker。
+  - **失败处理**: 若重试次数超过 3 次，或检测到任意 Worker 状态为 `FAILED`，则标记整个任务为 `FAILED` 并触发快速失败。
+
+- **SUMMARIZING 阶段超时**:
+  - **检测**: 任务状态为 `SUMMARIZING` 且超时。
+  - **策略**: Forum Engine 可能卡死或消息丢失。
+  - **操作**: 重新发送 `FINAL_CHECK` 指令。
+  - **降级处理**: 若重试超过 3 次，执行**服务降级**——跳过 Forum 总结，强制将状态流转至 `GENERATING`，确保用户能拿到基础报告。
+
+- **GENERATING 阶段超时**:
+  - **检测**: 任务状态为 `GENERATING` 且超时。
+  - **策略**: Report Engine 生成耗时过长或崩溃。
+  - **操作**: 重新发送 `task:report:request` 消息到 Redis Stream。
+
+#### B. 快速失败与任务取消 (Fail Fast & Cancellation)
+为了节省昂贵的 AI 算力和 Token 消耗，系统实现了分布式任务取消机制：
+
+1.  **触发条件**: 
+    - 当 `TaskTimeoutMonitor` 判定任务失败（如重试超限）。
+    - 或当任意 Worker 报告明确的 `FAILED` 状态。
+2.  **广播指令**: 
+    - Orchestrator 通过 Redis Pub/Sub 频道 `task:control` 广播 `CANCEL:{taskId}` 指令。
+3.  **Worker 响应**: 
+    - 所有 Worker (`AbstractAgent`) 均订阅该频道。
+    - Worker 在执行长耗时操作（如 `processParagraph`, `reflectionLoop`）的每个关键节点前，都会检查本地的 `cancelledTasks` 缓存。
+    - 一旦发现当前任务被取消，立即抛出异常中断执行，停止后续的 LLM 调用和搜索请求。
+
+### 5. 分布式一致性
 - **MongoDB**: 作为“单一事实来源”存储任务状态 (`TaskStatus`) 和业务数据。
 - **Redisson**: 使用分布式锁 (`lock:task:{id}`) 保护状态流转逻辑，防止并发事件导致的状态错乱。
 

@@ -2,6 +2,7 @@ package com.souyu.common.agent;
 
 import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.client.TimeContextChatClient;
+import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.node.querynode.*;
 import com.souyu.common.producer.messageProducer;
@@ -75,6 +76,9 @@ public abstract class AbstractAgent<R, C> {
     
     @Autowired
     private TaskStatusManager taskStatusManager; // 注入新的状态管理器
+    
+    @Autowired
+    private TaskControlManager taskControlManager; // 注入任务控制管理器
 
     @Autowired
     private messageProducer producer;
@@ -91,6 +95,9 @@ public abstract class AbstractAgent<R, C> {
         logger.info("============================================================");
 
         try {
+            // 检查取消状态
+            checkIfCancelled(taskId);
+            
             // Step 1: 生成报告结构
             stateManager.executeUpdate(taskId, state -> generateReportStructure(state, query));
 
@@ -100,13 +107,19 @@ public abstract class AbstractAgent<R, C> {
 
             // Step 2: 处理每个段落
             for (int i = 0; i < totalParagraphs; i++) {
+                checkIfCancelled(taskId); // 每次循环前检查
                 try {
                     processParagraph(taskId, i);
                 } catch (Exception e) {
+                    if (e instanceof RuntimeException && "Task cancelled".equals(e.getMessage())) {
+                        throw e;
+                    }
                     logger.error("处理段落 {} 失败: {}", i + 1, e.getMessage(), e);
                     // 继续处理下一个段落，不中断整个任务
                 }
             }
+
+            checkIfCancelled(taskId);
 
             // Step 3: 生成最终报告
             String finalReport = stateManager.executeUpdateAndReturn(taskId, this::generateFinalReport);
@@ -129,10 +142,25 @@ public abstract class AbstractAgent<R, C> {
             logger.info("============================================================");
 
         } catch (Exception e) {
-            logger.error("深度研究过程中发生错误: {}", e.getMessage(), e);
-            stateManager.markTaskFailed(taskId, e.getMessage());
-            // 更新 TaskStatus 为 FAILED
-            taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.FAILED);
+            if ("Task cancelled".equals(e.getMessage())) {
+                logger.warn("Task {} was cancelled.", taskId);
+                // 可以选择更新状态为 FAILED 或 CANCELLED (如果支持)
+                // 这里简单处理，不发送完成事件
+            } else {
+                logger.error("深度研究过程中发生错误: {}", e.getMessage(), e);
+                stateManager.markTaskFailed(taskId, e.getMessage());
+                // 更新 TaskStatus 为 FAILED
+                taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.FAILED);
+            }
+        } finally {
+            // 清理取消状态
+            taskControlManager.clearTask(taskId);
+        }
+    }
+    
+    private void checkIfCancelled(String taskId) {
+        if (taskControlManager.isCancelled(taskId)) {
+            throw new RuntimeException("Task cancelled");
         }
     }
 
@@ -201,6 +229,8 @@ public abstract class AbstractAgent<R, C> {
      * 处理单个段落
      */
     public void processParagraph(String taskId, Integer paragraphIndex) {
+        checkIfCancelled(taskId);
+        
         State stateSnapshot = stateManager.getState(taskId);
         if (stateSnapshot == null) return;
         Paragraph paragraphSnapshot = stateSnapshot.getParagraph(paragraphIndex);
@@ -264,6 +294,7 @@ public abstract class AbstractAgent<R, C> {
         int maxReflections = getAgentConfig().getSearch().getMaxReflections();
 
         for (int i = 0; i < maxReflections; i++) {
+            checkIfCancelled(taskId);
             logger.info("  - 反思 {}/{}", i + 1, maxReflections);
 
             try {

@@ -13,6 +13,7 @@ import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -43,6 +44,30 @@ public class TaskStatusManager {
      */
     public TaskStatus getTaskStatus(String taskId) {
         return mongoTemplate.findById(taskId, TaskStatus.class);
+    }
+
+    /**
+     * 查找超时任务
+     * @param status 任务状态
+     * @param timeoutThreshold 超时时间（分钟）
+     * @return 超时任务列表
+     */
+    public List<TaskStatus> findStuckTasks(TaskStatus.Status status, int timeoutThreshold) {
+        LocalDateTime thresholdTime = LocalDateTime.now().minusMinutes(timeoutThreshold);
+        Query query = new Query(Criteria.where("status").is(status)
+                .and("updatedAt").lt(thresholdTime));
+        return mongoTemplate.find(query, TaskStatus.class);
+    }
+    
+    /**
+     * 增加重试计数并更新时间
+     */
+    public void incrementRetryCount(String taskId) {
+        executeWithLock(taskId, (taskStatus) -> {
+            taskStatus.incrementRetryCount();
+            taskStatus.setUpdatedAt(LocalDateTime.now());
+            mongoTemplate.save(taskStatus);
+        });
     }
 
     /**
@@ -77,6 +102,7 @@ public class TaskStatusManager {
             // 如果 Forum 完成总结，流转到 GENERATING
             if (status == TaskStatus.WorkerStatus.COMPLETED && taskStatus.getStatus() == TaskStatus.Status.SUMMARIZING) {
                 logger.info("Forum summary completed for task: {}. Transitioning to GENERATING.", taskId);
+                taskStatus.setStatus(TaskStatus.Status.GENERATING);
             }
 
             mongoTemplate.save(taskStatus);
@@ -128,7 +154,7 @@ public class TaskStatusManager {
      * 这里假设我们知道有哪些 Worker，或者根据已有的 key 判断
      * 如果需要严格校验，可以在 initTask 时预设 worker keys
      */
-    private boolean areAllWorkersCompleted(TaskStatus taskStatus) {
+    public boolean areAllWorkersCompleted(TaskStatus taskStatus) {
         Map<String, TaskStatus.WorkerStatus> workers = taskStatus.getWorkerStatus();
         if (workers == null || workers.isEmpty()) {
             return false; // 或者 true，取决于业务逻辑，这里假设至少有一个 worker
