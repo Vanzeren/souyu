@@ -2,6 +2,7 @@ package com.souyu.forum.agent;
 
 import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.manager.TaskStatusManager;
+import com.souyu.common.producer.messageProducer;
 import jakarta.el.ExpressionFactory;
 import lombok.Data;
 import org.redisson.api.RAtomicLong;
@@ -49,11 +50,12 @@ public class consumer implements InitializingBean, DisposableBean {
     
     @Autowired
     private TaskStatusManager taskStatusManager; // 注入状态管理器
+    
+    @Autowired
+    private messageProducer producer; // 注入消息生产者
 
     private final String LOCK_PREFIX="souyu:forum:lock:";
     private final String streamKey = "forum";
-    private final String preFinishedStreamKey = "task:prefinished:stream";
-    private final String finishedStreamKey = "task:finished:stream";
     private final String groupName = "forum-consumer";
 
 
@@ -101,7 +103,6 @@ public class consumer implements InitializingBean, DisposableBean {
     @Override
     public void afterPropertiesSet() {
         executorService.submit(this::consumeMessages);
-        executorService.submit(this::consumePreFinishedMessages);
     }
 
     private void consumeMessages() {
@@ -143,106 +144,6 @@ public class consumer implements InitializingBean, DisposableBean {
         }
     }
 
-    private void consumePreFinishedMessages() {
-        logger.info("Starting to consume messages from stream: {}", preFinishedStreamKey);
-        // 这里简单起见，使用独立消费者组或者直接读取最新消息，假设使用独立组
-        String preFinishedGroup = "forum-prefinished-consumer";
-        try {
-             // 确保 Stream 存在
-            if (Boolean.FALSE.equals(redisTemplate.hasKey(preFinishedStreamKey))) {
-                redisTemplate.opsForStream().add(MapRecord.create(preFinishedStreamKey, Map.of("init", "true")));
-            }
-             redisTemplate.opsForStream().createGroup(preFinishedStreamKey, ReadOffset.latest(), preFinishedGroup);
-        } catch (Exception e) {
-            // ignore if exists
-        }
-
-        while (running) {
-            try {
-                @SuppressWarnings("unchecked")
-                List<MapRecord<String, Object, Object>> messages = redisTemplate.opsForStream().read(
-                        Consumer.from(preFinishedGroup, "pre1"),
-                        StreamReadOptions.empty().block(Duration.ofSeconds(2)),
-                        StreamOffset.create(preFinishedStreamKey, ReadOffset.lastConsumed())
-                );
-
-                if (messages != null && !messages.isEmpty()) {
-                    for (MapRecord<String, Object, Object> message : messages) {
-                        handlePreFinishedMessage(message);
-                        redisTemplate.opsForStream().acknowledge(preFinishedStreamKey, preFinishedGroup, message.getId());
-                    }
-                }
-            } catch (Exception e) {
-                logger.error("Error consuming pre-finished messages", e);
-                 try {
-                    Thread.sleep(5000);
-                } catch (InterruptedException ex) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }
-    }
-
-    private void handlePreFinishedMessage(MapRecord<String, Object, Object> message) {
-        try {
-            Map<Object, Object> body = message.getValue();
-            if (body.containsKey("init")) return;
-            
-            String taskId = body.get("taskId") != null ? body.get("taskId").toString() : null;
-            if (taskId == null) return;
-
-            logger.info("Received pre-finished signal for task: {}", taskId);
-            
-            RLock taskLock = redissonClient.getLock("souyu:forum:tasklock:" + taskId);
-            taskLock.lock();
-            try {
-                // 检查最后一条日志是否是 HOST
-                boolean lastIsHost = checkLastIsHost(taskId);
-
-                if (lastIsHost) {
-                    logger.info("Last log is HOST for task {}, decrementing count and sending finished signal.", taskId);
-                    RAtomicLong atomicCount = redissonClient.getAtomicLong("task:count:" + taskId);
-                    long remaining = atomicCount.decrementAndGet();
-                    
-                    if (remaining == 0) {
-                        sendFinishedSignal(taskId);
-                    }
-                } else {
-                    logger.info("Last log is NOT HOST for task {}, triggering summary.", taskId);
-                    // 如果最后一条不是 HOST，说明还有未总结的内容，强制总结
-                    
-                    // 更新 Forum 状态为 RUNNING
-                    taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
-                    
-                    String summary = reportService.generateHostSpeech(taskId);
-                    if (summary != null) {
-                        saveSummaryToMongo(taskId, summary);
-                        
-                        // 更新 Forum 状态为 COMPLETED
-                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                        
-                        // 总结完后再减
-                        RAtomicLong atomicCount = redissonClient.getAtomicLong("task:count:" + taskId);
-                        long remaining = atomicCount.decrementAndGet();
-                         if (remaining == 0) {
-                            sendFinishedSignal(taskId);
-                        }
-                    } else {
-                        // 如果生成失败，标记为 FAILED
-                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.FAILED);
-                    }
-                }
-
-            } finally {
-                taskLock.unlock();
-            }
-
-        } catch (Exception e) {
-            logger.error("Error handling pre-finished message", e);
-        }
-    }
-
     private void handleMessage(MapRecord<String, Object, Object> message) {
 
         try {
@@ -254,9 +155,17 @@ public class consumer implements InitializingBean, DisposableBean {
             String taskId = body.get("taskId") != null ? body.get("taskId").toString() : null;
             String content = body.get("content") != null ? body.get("content").toString() : null;
             String engine = body.get("engine") != null ? body.get("engine").toString() : "unknown";
+            String type = body.get("type") != null ? body.get("type").toString() : null;
 
             if (taskId == null) {
                 logger.warn("Received message without taskId, skipping: {}", message.getId());
+                return;
+            }
+            
+            // 处理 Master 发来的 FINAL_CHECK 指令
+            if ("FINAL_CHECK".equals(type) && "MASTER".equals(engine)) {
+                logger.info("Received FINAL_CHECK from Master for task: {}", taskId);
+                performFinalCheck(taskId);
                 return;
             }
 
@@ -290,22 +199,7 @@ public class consumer implements InitializingBean, DisposableBean {
 
                 // 3. 如果返回 1，说明达到阈值
                 if (result != null && result == 1) {
-                    // 在生成总结前，先检查最后一条是否已经是 HOST，避免重复总结
-                    if (!checkLastIsHost(taskId)) {
-                        // 更新 Forum 状态为 RUNNING
-                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
-                        
-                        String summary = reportService.generateHostSpeech(taskId);
-                        if (summary != null) {
-                            saveSummaryToMongo(taskId, summary);
-                            // 更新 Forum 状态为 COMPLETED
-                            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                        } else {
-                             taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.FAILED);
-                        }
-                    } else {
-                        logger.info("Last log is already HOST, skipping summary generation for task: {}", taskId);
-                    }
+                    performSummary(taskId, false); // 阶段性总结，不标记为 COMPLETED
                 }
             } finally {
                 taskLock.unlock();
@@ -313,6 +207,63 @@ public class consumer implements InitializingBean, DisposableBean {
 
         } catch (Exception e) {
             logger.error("Failed to process message: {}", message.getId(), e);
+        }
+    }
+    
+    /**
+     * 执行最终检查 (响应 Master 的 FINAL_CHECK)
+     */
+    private void performFinalCheck(String taskId) {
+        RLock taskLock = redissonClient.getLock("souyu:forum:tasklock:" + taskId);
+        taskLock.lock();
+        try {
+            if (!checkLastIsHost(taskId)) {
+                logger.info("Final check: Last log is NOT HOST, performing summary for task: {}", taskId);
+                performSummary(taskId, true); // 最终总结，标记为 COMPLETED
+            } else {
+                logger.info("Final check: Last log is already HOST, marking as COMPLETED for task: {}", taskId);
+                // 即使已经是 HOST，也要确保状态是 COMPLETED 并发送事件，以防万一
+                taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                producer.triggerMasterReport(taskId, "forum");
+            }
+        } finally {
+            taskLock.unlock();
+        }
+    }
+    
+    /**
+     * 执行总结逻辑
+     * @param isFinal 是否为最终总结
+     */
+    private void performSummary(String taskId, boolean isFinal) {
+        // 在生成总结前，先检查最后一条是否已经是 HOST，避免重复总结
+        if (!checkLastIsHost(taskId)) {
+            // 更新 Forum 状态为 RUNNING
+            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
+            
+            String summary = reportService.generateHostSpeech(taskId);
+            if (summary != null) {
+                saveSummaryToMongo(taskId, summary);
+                
+                if (isFinal) {
+                    // 只有最终总结才更新为 COMPLETED 并发送事件
+                    taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                    producer.triggerMasterReport(taskId, "forum");
+                } else {
+                    // 阶段性总结，状态可以保持 RUNNING 或者改回 PENDING，这里保持 RUNNING 即可
+                    // 或者不更新状态，因为 TaskStatusManager 默认没有 PENDING -> RUNNING -> PENDING 的流转
+                    // 简单起见，我们不更新为 COMPLETED
+                    logger.info("Intermediate summary generated for task: {}", taskId);
+                }
+            } else {
+                 taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.FAILED);
+            }
+        } else {
+            logger.info("Last log is already HOST, skipping summary generation for task: {}", taskId);
+            if (isFinal) {
+                 taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                 producer.triggerMasterReport(taskId, "forum");
+            }
         }
     }
 
@@ -325,14 +276,6 @@ public class consumer implements InitializingBean, DisposableBean {
             return "HOST".equals(lastLog.getEngine());
         }
         return false;
-    }
-
-    private void sendFinishedSignal(String taskId) {
-        Map<String, String> finishedMessage = new HashMap<>();
-        finishedMessage.put("taskId", taskId);
-        finishedMessage.put("workerTime", LocalDateTime.now().toString());
-        redisTemplate.opsForStream().add(finishedStreamKey, finishedMessage);
-        logger.info("Sent finished signal for task {}", taskId);
     }
 
     private void saveSummaryToMongo(String taskId, String summary) {

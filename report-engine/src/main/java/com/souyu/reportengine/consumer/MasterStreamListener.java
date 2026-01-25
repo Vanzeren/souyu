@@ -1,18 +1,18 @@
 package com.souyu.reportengine.consumer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.manager.ReportDocument;
 import com.souyu.common.manager.StateDocument;
 import com.souyu.common.manager.TaskStatusManager;
+import com.souyu.common.producer.messageProducer;
 import com.souyu.reportengine.angent.ReportAgent;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
-import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.data.redis.connection.stream.MapRecord;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.stream.StreamListener;
@@ -37,7 +37,13 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
     private ReportAgent reportAgent;
     
     @Autowired
-    private TaskStatusManager taskStatusManager; // 注入状态管理器
+    private TaskStatusManager taskStatusManager;
+
+    @Autowired
+    private RedissonClient redissonClient;
+    
+    @Autowired
+    private messageProducer producer; // 用于发送指令给 Forum
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -45,59 +51,118 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
     public void onMessage(MapRecord<String, String, String> message) {
         Map<String, String> body = message.getValue();
         String taskId = body.get("taskId");
+        String eventType = body.get("type");
+        String source = body.get("source");
 
-        // 检查 Redis 计数器（确认是否所有 Worker 都已发送过 DECR）
-        String countStr = redisTemplate.opsForValue().get("task:count:" + taskId);
+        if (taskId == null) return;
+        
+        logger.info("Master received raw message: {}", body);
 
-//        if ("0".equals(countStr)) {
-            logger.info("Master 收到所有通知，开始为任务 " + taskId + " 生成最终报告...");
-            
-            // 更新主状态为 GENERATING
-            taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.GENERATING);
+        RLock lock = redissonClient.getLock("lock:master:event:" + taskId);
+        lock.lock();
+        try {
+            // 重新从数据库获取最新状态，确保数据一致性
+            TaskStatus status = taskStatusManager.getTaskStatus(taskId);
+            if (status == null) return;
 
-            try {
-                // 1. 获取所有必要数据
-                List<Object> reports = getReport(taskId);
-                String forumLogs = getForum(taskId);
-                String query = getQuery(taskId);
+            logger.info("Master processing event: {} from {} for task {}", eventType, source, taskId);
 
-                if (query == null) {
-                    throw new IllegalArgumentException("未找到任务 " + taskId + " 的查询主题 (query)");
-                }
-
-                // 2. 调用 ReportAgent 生成报告
-                Map<String, Object> reportResult = reportAgent.generateReport(
-                        query,           // 查询主题
-                        reports,         // 分析引擎报告
-                        forumLogs != null ? forumLogs : "",       // 论坛日志
-                        null,            // 自定义模板（null 表示自动选择）
-                        (eventType, payload) -> {  // 流式事件回调
-                            // 处理流式事件，可以发送到前端或记录日志
-                            logger.info("报告生成事件: " + eventType + " - " + payload);
+            // 场景 1: Worker 完成
+            if ("WORKER_COMPLETED".equals(eventType)) {
+                // 检查是否所有 Worker 都完成了
+                boolean allWorkersDone = checkAllWorkersDone(status);
+                
+                if (allWorkersDone) {
+                    logger.info("All workers completed for task {}. Checking Forum status...", taskId);
+                    
+                    // 检查 Forum 是否已经完成了总结
+                    if (status.getForumStatus() == TaskStatus.WorkerStatus.COMPLETED) {
+                        // 如果 Forum 已经完了（可能是自动触发的），直接生成报告
+                        startGeneratingReport(taskId);
+                    } else {
+                        // 如果 Forum 还没完，或者处于 PENDING/RUNNING
+                        // 发送指令给 Forum 进行“最终总结检查”
+                        logger.info("Triggering final summary check for Forum on task {}", taskId);
+                        producer.sendMessage("forum", Map.of(
+                                "taskId", taskId,
+                                "type", "FINAL_CHECK", // 特殊指令
+                                "engine", "MASTER"
+                        ));
+                        
+                        // 更新主状态为 SUMMARIZING (如果还没更新)
+                        if (status.getStatus() != TaskStatus.Status.SUMMARIZING) {
+                            taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.SUMMARIZING);
                         }
-                );
-
-                // 3. 保存生成的报告到 MongoDB
-                saveGeneratedReport(taskId, reportResult);
-
-                // 4. 更新任务状态为完成
-                String reportId = reportResult.get("report_id").toString();
-                taskStatusManager.markTaskCompleted(taskId, reportId);
-
-                logger.info("任务 " + taskId + " 报告生成完成，报告ID: " + reportId);
-
-            } catch (Exception e) {
-                logger.error("生成报告失败: " + e.getMessage());
-                e.printStackTrace();
-
-                // 更新任务状态为失败
-                taskStatusManager.markTaskFailed(taskId, e.getMessage());
-            } finally {
-                // 处理完后清理 Redis 数据
-                redisTemplate.delete("task:count:" + taskId);
-                redisTemplate.delete("task:progress:" + taskId + ":*");
+                    }
+                }
             }
-//        }
+            // 场景 2: Forum 完成 (可能是自动触发，也可能是响应 FINAL_CHECK)
+            else if ("FORUM_COMPLETED".equals(eventType)) {
+                // 检查 Worker 是否也都完了
+                if (checkAllWorkersDone(status)) {
+                    startGeneratingReport(taskId);
+                } else {
+                    logger.info("Forum completed, but waiting for other workers for task {}", taskId);
+                }
+            }
+
+        } catch (Exception e) {
+            logger.error("Error processing event for task {}", taskId, e);
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    private boolean checkAllWorkersDone(TaskStatus status) {
+        Map<String, TaskStatus.WorkerStatus> workers = status.getWorkerStatus();
+        if (workers == null) return false;
+        for (TaskStatus.WorkerStatus s : workers.values()) {
+            if (s != TaskStatus.WorkerStatus.COMPLETED) return false;
+        }
+        return true;
+    }
+
+    private void startGeneratingReport(String taskId) {
+        // 防止重复生成
+        TaskStatus currentStatus = taskStatusManager.getTaskStatus(taskId);
+        if (currentStatus.getStatus() == TaskStatus.Status.GENERATING || 
+            currentStatus.getStatus() == TaskStatus.Status.COMPLETED) {
+            logger.info("Report generation already started or completed for task {}", taskId);
+            return;
+        }
+
+        logger.info("Starting final report generation for task {}", taskId);
+        taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.GENERATING);
+
+        try {
+            List<Object> reports = getReport(taskId);
+            String forumLogs = getForum(taskId);
+            String query = getQuery(taskId);
+
+            if (query == null) {
+                throw new IllegalArgumentException("Query not found for task " + taskId);
+            }
+
+            Map<String, Object> reportResult = reportAgent.generateReport(
+                    query,
+                    reports,
+                    forumLogs != null ? forumLogs : "",
+                    null,
+                    (eventType, payload) -> logger.info("Report event: {} - {}", eventType, payload)
+            );
+
+            saveGeneratedReport(taskId, reportResult);
+            String reportId = reportResult.get("report_id").toString();
+            taskStatusManager.markTaskCompleted(taskId, reportId);
+            logger.info("Report generated successfully for task {}. Report ID: {}", taskId, reportId);
+
+        } catch (Exception e) {
+            logger.error("Failed to generate report for task {}", taskId, e);
+            taskStatusManager.markTaskFailed(taskId, e.getMessage());
+        } finally {
+             // 清理资源
+             redisTemplate.delete("task:progress:" + taskId + ":*");
+        }
     }
 
     private List<Object> getReport(String taskId) {
@@ -128,24 +193,16 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
         return null;
     }
 
-    /**
-     * 保存生成的报告到 MongoDB
-     */
     private void saveGeneratedReport(String taskId, Map<String, Object> reportResult) {
         try {
             ReportDocument reportDoc = new ReportDocument();
             reportDoc.setId(taskId);
             reportDoc.setName(reportResult.get("report_id").toString());
-            // 这里假设 htmlContent 是我们想保存的主要内容，或者你可以根据需要调整
             reportDoc.setContent(reportResult.get("html_content").toString());
             reportDoc.setTimestamp(System.currentTimeMillis());
-
-            // 保存到 reports_final 集合
             mongoTemplate.save(reportDoc, "reports_final");
-
-            System.out.println("报告已保存到 MongoDB，集合: reports_final");
         } catch (Exception e) {
-            System.err.println("保存报告到 MongoDB 失败: " + e.getMessage());
+            logger.error("Failed to save report to MongoDB", e);
             throw e;
         }
     }

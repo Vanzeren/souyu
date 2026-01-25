@@ -26,11 +26,11 @@ public class messageProducer {
     private RedissonClient redissonClient;
 
 
-
     /**
      * 发送消息到 Redis Stream
+     *
      * @param streamKey Stream 的键名
-     * @param message 消息内容 Map
+     * @param message   消息内容 Map
      * @return 生成的消息 ID
      */
     public String sendMessage(String streamKey, Map<String, String> message) {
@@ -43,7 +43,7 @@ public class messageProducer {
 
             // 发送消息
             RecordId recordId = this.redisTemplate.opsForStream().add(record);
-            
+
             if (recordId != null) {
                 logger.debug("Sent message to stream [{}]: {}", streamKey, recordId);
                 return recordId.getValue();
@@ -55,34 +55,38 @@ public class messageProducer {
         }
     }
 
-    public void triggerMasterReport(String taskId) {
-        String streamKey= "task:prefinished:stream";
-        RAtomicLong atomicCount = redissonClient.getAtomicLong("task:count:" + taskId);
-        // decrementAndGet 会返回减完之后的最新值
-        long remaining = atomicCount.decrementAndGet();
+    /**
+     * 触发 Master 报告生成 (发送 WORKER_COMPLETED 事件)
+     * 
+     * @param taskId 任务ID
+     * @param engine 引擎名称 (query, media, forum)
+     */
+    public void triggerMasterReport(String taskId, String engine) {
+        // 统一使用 task:events:stream
+        String streamKey = "task:events:stream";
 
-        if (remaining == 1) {
-            // 说明是最后一个执行完的 worker，可以触发后续逻辑
-            Map<String, String> message = new HashMap<>();
-            message.put("taskId", taskId);
-            message.put("workerTime", LocalDateTime.now().toString());
-            try {
-                // 构建记录
-                ObjectRecord<String, Map<String, String>> record = StreamRecords.newRecord()
-                        .in(streamKey)
-                        .ofObject(message)
-                        .withId(RecordId.autoGenerate());
+        Map<String, String> message = new HashMap<>();
+        message.put("taskId", taskId);
+        message.put("type", "WORKER_COMPLETED"); // 明确事件类型
+        message.put("source", engine);           // 明确来源
+        message.put("timestamp", LocalDateTime.now().toString());
+        
+        try {
+            // 构建记录
+            ObjectRecord<String, Map<String, String>> record = StreamRecords.newRecord()
+                    .in(streamKey)
+                    .ofObject(message)
+                    .withId(RecordId.autoGenerate());
 
-                // 发送消息
-                RecordId recordId = this.redisTemplate.opsForStream().add(record);
+            // 发送消息
+            RecordId recordId = this.redisTemplate.opsForStream().add(record);
 
-                if (recordId != null) {
-                    logger.debug("Sent message to stream [{}]: {}", streamKey, recordId);
-                }
-            } catch (Exception e) {
-                logger.error("Failed to send message to stream [{}]", streamKey, e);
-                throw e;
+            if (recordId != null) {
+                logger.info("Sent WORKER_COMPLETED event to stream [{}] for task {}, source: {}", streamKey, taskId, engine);
             }
+        } catch (Exception e) {
+            logger.error("Failed to send message to stream [{}]", streamKey, e);
+            throw e;
         }
     }
 }

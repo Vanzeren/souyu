@@ -118,11 +118,11 @@ public abstract class AbstractAgent<R, C> {
                 saveReport(taskId, finalState, finalReport,engineName());
             }
 
-            //标记报告已完成
-            producer.triggerMasterReport(taskId);
-            
             // 更新 TaskStatus 为 COMPLETED
             taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.COMPLETED);
+            
+            // 标记报告已完成 (发送 WORKER_COMPLETED 事件)
+            producer.triggerMasterReport(taskId, engineName());
 
             logger.info("\n============================================================");
             logger.info("深度研究完成！");

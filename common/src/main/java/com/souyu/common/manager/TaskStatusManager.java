@@ -77,7 +77,6 @@ public class TaskStatusManager {
             // 如果 Forum 完成总结，流转到 GENERATING
             if (status == TaskStatus.WorkerStatus.COMPLETED && taskStatus.getStatus() == TaskStatus.Status.SUMMARIZING) {
                 logger.info("Forum summary completed for task: {}. Transitioning to GENERATING.", taskId);
-                taskStatus.setStatus(TaskStatus.Status.GENERATING);
             }
 
             mongoTemplate.save(taskStatus);
