@@ -165,18 +165,3 @@ sequenceDiagram
 - **MongoDB**: 作为“单一事实来源”存储任务状态 (`TaskStatus`) 和业务数据。
 - **Redisson**: 使用分布式锁 (`lock:task:{id}`) 保护状态流转逻辑，防止并发事件导致的状态错乱。
 
-## 📝 快速开始
-
-1. **环境准备**:
-   - JDK 17+
-   - Maven 3.8+
-   - 运行中的 Redis (需设置密码), MongoDB 实例。
-   - 配置 OpenAI, Tavily, Bocha 等 API Key。
-
-2. **构建项目**:
-   ```bash
-   mvn clean install
-   ```
-
-3. **运行**:
-   先启动 `orchestrator`，然后启动其他引擎 (`query-engine`, `media-engine`, `report-engine`, `forum-engine`)。
