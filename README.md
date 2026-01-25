@@ -1,7 +1,7 @@
 # Souyu 项目
 
 Souyu 是一个基于现代 Java 技术栈构建的综合性分布式系统，专注于查询处理、媒体处理、报表生成和论坛交互等领域的 AI 驱动能力。
-
+本项目是基于bettafish的分布式java重构，原项目链接为https://github.com/666ghj/BettaFish。
 ## 🛠 技术栈
 
 - **编程语言**: Java 17
