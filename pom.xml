@@ -26,6 +26,7 @@
         <module>media-engine</module>
         <module>report-engine</module>
         <module>forum-engine</module>
+        <module>orchestrator</module>
     </modules>
 
     <dependencyManagement>

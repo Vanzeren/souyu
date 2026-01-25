@@ -1,0 +1,36 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: orchestrator
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: ${REDIS_PASSWORD:123456}
+      database: 0
+    mongodb:
+      # 尝试移除 authSource=admin，让驱动默认使用 souyu 数据库进行认证
+      # 或者您可以尝试 uri: mongodb://root:123456@localhost:27017/souyu?authSource=souyu
+      uri: ${MONGODB_URI:mongodb://admin:123456@localhost:27017/souyu?authSource=admin}
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:placeholder}
+
+app:
+  query-engine:
+    url: http://localhost:8081
+  media-engine:
+    url: http://localhost:8082
+  report-engine:
+    url: http://localhost:8083
+
+orchestrator:
+  worker-count: 2
+
+# Placeholder for common module dependencies
+bocha:
+  api-key: ${BOCHA_API_KEY:placeholder}
+tavily:
+  api-key: ${TAVILY_API_KEY:placeholder}
