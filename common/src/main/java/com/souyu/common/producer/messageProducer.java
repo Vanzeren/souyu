@@ -59,33 +59,42 @@ public class messageProducer {
      * 触发 Master 报告生成 (发送 WORKER_COMPLETED 事件)
      * 
      * @param taskId 任务ID
-     * @param engine 引擎名称 (query, media, forum)
+     * @param engine 引擎名称 (query, media)
      */
     public void triggerMasterReport(String taskId, String engine) {
-        // 统一使用 task:events:stream
+        sendEvent(taskId, "WORKER_COMPLETED", engine);
+    }
+    
+    /**
+     * 触发 Forum 完成事件
+     * @param taskId 任务ID
+     */
+    public void triggerForumCompleted(String taskId) {
+        sendEvent(taskId, "FORUM_COMPLETED", "forum");
+    }
+    
+    private void sendEvent(String taskId, String type, String source) {
         String streamKey = "task:events:stream";
 
         Map<String, String> message = new HashMap<>();
         message.put("taskId", taskId);
-        message.put("type", "WORKER_COMPLETED"); // 明确事件类型
-        message.put("source", engine);           // 明确来源
+        message.put("type", type);
+        message.put("source", source);
         message.put("timestamp", LocalDateTime.now().toString());
         
         try {
-            // 构建记录
             ObjectRecord<String, Map<String, String>> record = StreamRecords.newRecord()
                     .in(streamKey)
                     .ofObject(message)
                     .withId(RecordId.autoGenerate());
 
-            // 发送消息
             RecordId recordId = this.redisTemplate.opsForStream().add(record);
 
             if (recordId != null) {
-                logger.info("Sent WORKER_COMPLETED event to stream [{}] for task {}, source: {}", streamKey, taskId, engine);
+                logger.info("Sent {} event to stream [{}] for task {}, source: {}", type, streamKey, taskId, source);
             }
         } catch (Exception e) {
-            logger.error("Failed to send message to stream [{}]", streamKey, e);
+            logger.error("Failed to send event to stream [{}]", streamKey, e);
             throw e;
         }
     }

@@ -108,6 +108,10 @@ public abstract class AbstractAgent<R, C> {
             // Step 2: 处理每个段落
             for (int i = 0; i < totalParagraphs; i++) {
                 checkIfCancelled(taskId); // 每次循环前检查
+                
+                // 发送心跳：更新任务时间，防止超时
+                taskStatusManager.refreshUpdateTime(taskId);
+
                 try {
                     processParagraph(taskId, i);
                 } catch (Exception e) {
@@ -131,10 +135,9 @@ public abstract class AbstractAgent<R, C> {
                 saveReport(taskId, finalState, finalReport,engineName());
             }
 
-            // 更新 TaskStatus 为 COMPLETED
-            taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.COMPLETED);
-            
             // 标记报告已完成 (发送 WORKER_COMPLETED 事件)
+            // 移除直接更新状态的调用
+            // taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.COMPLETED);
             producer.triggerMasterReport(taskId, engineName());
 
             logger.info("\n============================================================");
@@ -149,8 +152,23 @@ public abstract class AbstractAgent<R, C> {
             } else {
                 logger.error("深度研究过程中发生错误: {}", e.getMessage(), e);
                 stateManager.markTaskFailed(taskId, e.getMessage());
-                // 更新 TaskStatus 为 FAILED
-                taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.FAILED);
+                
+                // 发送 WORKER_FAILED 事件 (需要 messageProducer 支持，或者复用 triggerMasterReport 并带上状态)
+                // 这里暂时使用 triggerMasterReport，但 Master 需要能识别失败
+                // 更好的做法是新增一个 triggerWorkerFailed 方法
+                // 暂时保留旧逻辑，或者我们修改 messageProducer
+                
+                // 既然要彻底解耦，我们应该发送 WORKER_FAILED
+                // 但为了不改动太多，我们先移除直接更新状态的调用
+                // taskStatusManager.updateWorkerStatus(taskId, engineName(), TaskStatus.WorkerStatus.FAILED);
+                
+                // 发送失败事件 (需要 messageProducer 支持)
+                Map<String, String> event = new HashMap<>();
+                event.put("taskId", taskId);
+                event.put("type", "WORKER_FAILED");
+                event.put("source", engineName());
+                event.put("error", e.getMessage());
+                producer.sendMessage("task:events:stream", event);
             }
         } finally {
             // 清理取消状态

@@ -3,6 +3,7 @@ package com.souyu.reportengine.consumer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.manager.ReportDocument;
+import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.producer.messageProducer;
 import com.souyu.reportengine.angent.ReportAgent;
 import org.slf4j.Logger;
@@ -30,6 +31,9 @@ public class ReportRequestConsumer implements StreamListener<String, MapRecord<S
     
     @Autowired
     private messageProducer producer;
+    
+    @Autowired
+    private TaskStatusManager taskStatusManager;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -49,8 +53,9 @@ public class ReportRequestConsumer implements StreamListener<String, MapRecord<S
             
             List<Object> reports = objectMapper.readValue(reportsJson, new TypeReference<List<Object>>() {});
 
-            // 调用 ReportAgent 生成报告
+            // 调用 ReportAgent 生成报告 (使用带 taskId 的重载方法)
             Map<String, Object> reportResult = reportAgent.generateReport(
+                    taskId, // 传入 taskId
                     query,
                     reports,
                     forumLogs,
@@ -74,7 +79,17 @@ public class ReportRequestConsumer implements StreamListener<String, MapRecord<S
 
         } catch (Exception e) {
             logger.error("Failed to generate report for task {}", taskId, e);
-            // 这里可以发送一个 REPORT_FAILED 事件，或者由 Orchestrator 的超时机制处理
+            
+            // 移除直接更新状态的调用
+            // taskStatusManager.markTaskFailed(taskId, "Report generation failed: " + e.getMessage());
+            
+            // 发送 REPORT_FAILED 事件
+            Map<String, String> event = new HashMap<>();
+            event.put("taskId", taskId);
+            event.put("type", "REPORT_FAILED");
+            event.put("source", "report-engine");
+            event.put("error", e.getMessage());
+            producer.sendMessage("task:events:stream", event);
         }
     }
 

@@ -69,6 +69,20 @@ public class TaskStatusManager {
             mongoTemplate.save(taskStatus);
         });
     }
+    
+    /**
+     * 刷新任务更新时间 (心跳)
+     * 这是一个轻量级操作，不需要加锁，直接使用 updateFirst
+     */
+    public void refreshUpdateTime(String taskId) {
+        Query query = new Query(Criteria.where("_id").is(taskId));
+        Update update = new Update().set("updatedAt", LocalDateTime.now());
+        
+        // 打印日志以确认调用
+        logger.info("Heartbeat: Refreshing update time for task: {}", taskId);
+        
+        mongoTemplate.updateFirst(query, update, TaskStatus.class);
+    }
 
     /**
      * 更新 Worker (Query/Media Engine) 的状态
@@ -79,11 +93,8 @@ public class TaskStatusManager {
             taskStatus.getWorkerStatus().put(workerName, status);
             taskStatus.setUpdatedAt(LocalDateTime.now());
             
-            // 检查是否所有 Worker 都已完成，如果是，则尝试流转主状态
-            if (status == TaskStatus.WorkerStatus.COMPLETED && areAllWorkersCompleted(taskStatus)) {
-                logger.info("All workers completed for task: {}. Transitioning to SUMMARIZING.", taskId);
-                taskStatus.setStatus(TaskStatus.Status.SUMMARIZING);
-            }
+            // 移除自动流转逻辑，交由 Master 处理
+            // if (status == TaskStatus.WorkerStatus.COMPLETED && areAllWorkersCompleted(taskStatus)) { ... }
             
             mongoTemplate.save(taskStatus);
             logger.info("Updated worker {} status to {} for task {}", workerName, status, taskId);
@@ -99,11 +110,8 @@ public class TaskStatusManager {
             taskStatus.setForumStatus(status);
             taskStatus.setUpdatedAt(LocalDateTime.now());
 
-            // 如果 Forum 完成总结，流转到 GENERATING
-            if (status == TaskStatus.WorkerStatus.COMPLETED && taskStatus.getStatus() == TaskStatus.Status.SUMMARIZING) {
-                logger.info("Forum summary completed for task: {}. Transitioning to GENERATING.", taskId);
-                taskStatus.setStatus(TaskStatus.Status.GENERATING);
-            }
+            // 移除自动流转逻辑，交由 Master 处理
+            // if (status == TaskStatus.WorkerStatus.COMPLETED && taskStatus.getStatus() == TaskStatus.Status.SUMMARIZING) { ... }
 
             mongoTemplate.save(taskStatus);
             logger.info("Updated forum status to {} for task {}", status, taskId);

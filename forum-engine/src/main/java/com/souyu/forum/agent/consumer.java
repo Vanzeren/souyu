@@ -224,7 +224,7 @@ public class consumer implements InitializingBean, DisposableBean {
                 logger.info("Final check: Last log is already HOST, marking as COMPLETED for task: {}", taskId);
                 // 即使已经是 HOST，也要确保状态是 COMPLETED 并发送事件，以防万一
                 taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                producer.triggerMasterReport(taskId, "forum");
+                producer.triggerForumCompleted(taskId); // 使用新方法
             }
         } finally {
             taskLock.unlock();
@@ -248,7 +248,7 @@ public class consumer implements InitializingBean, DisposableBean {
                 if (isFinal) {
                     // 只有最终总结才更新为 COMPLETED 并发送事件
                     taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                    producer.triggerMasterReport(taskId, "forum");
+                    producer.triggerForumCompleted(taskId); // 使用新方法
                 } else {
                     // 阶段性总结，状态可以保持 RUNNING 或者改回 PENDING，这里保持 RUNNING 即可
                     // 或者不更新状态，因为 TaskStatusManager 默认没有 PENDING -> RUNNING -> PENDING 的流转
@@ -262,7 +262,7 @@ public class consumer implements InitializingBean, DisposableBean {
             logger.info("Last log is already HOST, skipping summary generation for task: {}", taskId);
             if (isFinal) {
                  taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                 producer.triggerMasterReport(taskId, "forum");
+                 producer.triggerForumCompleted(taskId); // 使用新方法
             }
         }
     }

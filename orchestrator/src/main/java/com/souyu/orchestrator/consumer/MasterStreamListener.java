@@ -1,10 +1,10 @@
 package com.souyu.orchestrator.consumer;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.manager.ReportDocument;
 import com.souyu.common.manager.StateDocument;
+import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.producer.messageProducer;
 import org.redisson.api.RLock;
@@ -36,6 +36,9 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
     
     @Autowired
     private TaskStatusManager taskStatusManager;
+    
+    @Autowired
+    private TaskControlManager taskControlManager;
 
     @Autowired
     private RedissonClient redissonClient;
@@ -59,12 +62,19 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
         RLock lock = redissonClient.getLock("lock:orchestrator:event:" + taskId);
         lock.lock();
         try {
+            // 重新从数据库获取最新状态，确保数据一致性
             TaskStatus status = taskStatusManager.getTaskStatus(taskId);
             if (status == null) return;
 
             logger.info("Orchestrator processing event: {} from {} for task {}", eventType, source, taskId);
 
+            // 场景 1: Worker 完成
             if ("WORKER_COMPLETED".equals(eventType)) {
+                // 更新 Worker 状态
+                taskStatusManager.updateWorkerStatus(taskId, source, TaskStatus.WorkerStatus.COMPLETED);
+                
+                // 重新获取状态以检查是否全部完成
+                status = taskStatusManager.getTaskStatus(taskId);
                 boolean allWorkersDone = checkAllWorkersDone(status);
                 
                 if (allWorkersDone) {
@@ -86,19 +96,43 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
                     }
                 }
             }
+            // 场景 2: Worker 失败
+            else if ("WORKER_FAILED".equals(eventType)) {
+                String error = body.get("error");
+                logger.error("Worker {} failed for task {}: {}", source, taskId, error);
+                
+                // 更新 Worker 状态
+                taskStatusManager.updateWorkerStatus(taskId, source, TaskStatus.WorkerStatus.FAILED);
+                
+                // 标记任务失败并广播取消
+                taskStatusManager.markTaskFailed(taskId, "Worker " + source + " failed: " + error);
+                taskControlManager.sendCancelCommand(taskId);
+            }
+            // 场景 3: Forum 完成
             else if ("FORUM_COMPLETED".equals(eventType)) {
+                // 更新 Forum 状态
+                taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                
+                // 重新获取状态
+                status = taskStatusManager.getTaskStatus(taskId);
                 if (checkAllWorkersDone(status)) {
                     startGeneratingReport(taskId);
                 } else {
                     logger.info("Forum completed, but waiting for other workers for task {}", taskId);
                 }
             }
+            // 场景 4: 报告生成完成
             else if ("REPORT_COMPLETED".equals(eventType)) {
-                // 报告生成完成，任务结束
                 String reportId = body.get("reportId");
                 taskStatusManager.markTaskCompleted(taskId, reportId);
                 logger.info("Task {} fully completed. Report ID: {}", taskId, reportId);
                 redisTemplate.delete("task:progress:" + taskId + ":*");
+            }
+            // 场景 5: 报告生成失败
+            else if ("REPORT_FAILED".equals(eventType)) {
+                String error = body.get("error");
+                logger.error("Report generation failed for task {}: {}", taskId, error);
+                taskStatusManager.markTaskFailed(taskId, "Report generation failed: " + error);
             }
 
         } catch (Exception e) {

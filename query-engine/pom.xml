@@ -48,13 +48,6 @@
             <version>8.5.9</version>
         </dependency>
 
-        <!-- DTO Module -->
-        <dependency>
-            <groupId>com.souyu</groupId>
-            <artifactId>shared-dto</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-
         <!-- Lombok for less boilerplate code -->
         <dependency>
             <groupId>org.projectlombok</groupId>
