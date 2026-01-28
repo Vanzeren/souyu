@@ -25,7 +25,11 @@
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-core</artifactId>
         </dependency>
-
+        <!-- 添加 OpenAI 支持以使用 OpenAiChatOptions -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+        </dependency>
 
         <!-- 添加测试依赖 -->
         <dependency>

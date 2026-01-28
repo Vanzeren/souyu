@@ -54,10 +54,6 @@ public class TavilyClient {
         return searchInternal(params);
     }
 
-    public TavilyResponse basicSearchNews(String query) {
-        return basicSearchNews(query, 7);
-    }
-
     /**
      * 深度新闻分析: 对一个主题进行最全面、最深入的搜索。
      */

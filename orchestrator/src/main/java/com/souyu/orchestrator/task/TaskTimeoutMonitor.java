@@ -26,7 +26,7 @@ import java.util.Map;
 public class TaskTimeoutMonitor {
 
     private static final Logger logger = LoggerFactory.getLogger(TaskTimeoutMonitor.class);
-    private static final int TIMEOUT_MINUTES = 10;
+    private static final int TIMEOUT_MINUTES = 15;
     private static final int MAX_RETRIES = 3;
 
     @Autowired

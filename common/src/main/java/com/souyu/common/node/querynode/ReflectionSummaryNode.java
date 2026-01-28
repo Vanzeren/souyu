@@ -6,20 +6,14 @@ import com.souyu.common.prompt.DeepSearchPrompts;
 import com.souyu.common.state.Paragraph;
 import com.souyu.common.state.State;
 import com.souyu.common.util.TextProcessing;
-import com.souyu.common.producer.messageProducer;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -31,32 +25,14 @@ import java.util.Map;
 public class ReflectionSummaryNode extends StateMutationNode<String, String> {
 
     private static final Logger logger = LoggerFactory.getLogger(ReflectionSummaryNode.class);
-    private static final ObjectMapper objectMapper = new ObjectMapper();
 
     public ReflectionSummaryNode(TimeContextChatClient chatClient) {
         super(chatClient, "ReflectionSummaryNode");
-    }
-    
-    @Override
-    public boolean validateInput(String inputData) {
-        if (inputData == null) return false;
-        try {
-            Map<String, Object> data = objectMapper.readValue(inputData, new TypeReference<>() {});
-            return data.containsKey("title") && data.containsKey("content") && 
-                   data.containsKey("search_query") && data.containsKey("search_results") && 
-                   data.containsKey("paragraph_latest_state");
-        } catch (JsonProcessingException e) {
-            return false;
-        }
     }
 
     @Override
     public String run(String inputData, Map<String, Object> kwargs) {
         try {
-            if (!validateInput(inputData)) {
-                throw new IllegalArgumentException("输入数据格式错误");
-            }
-
             logger.info("正在生成反思总结");
 
             // 检查 kwargs 中是否有自定义的 prompt

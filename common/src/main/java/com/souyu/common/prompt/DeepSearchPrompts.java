@@ -5,7 +5,7 @@ public final class DeepSearchPrompts {
     private DeepSearchPrompts() {
     }
 
-    // ===== JSON Schema 定义 =====
+    // ===== JSON Schema 定义 (保持不变) =====
 
     public static final String OUTPUT_SCHEMA_REPORT_STRUCTURE = """
             {
@@ -13,9 +13,10 @@ public final class DeepSearchPrompts {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "title": {"type": "string"},
-                        "content": {"type": "string"}
-                    }
+                        "title": {"type": "string", "description": "段落标题"},
+                        "content": {"type": "string", "description": "段落的详细描述、研究方向和预期包含的关键信息点。此字段必须包含具体内容，不能为空。"}
+                    },
+                    "required": ["title", "content"]
                 }
             }
             """;
@@ -131,57 +132,31 @@ public final class DeepSearchPrompts {
             }
             """;
             
-    // ===== 系统提示词定义 =====
+    // ===== 系统提示词定义 (修改为使用占位符，移除 String.format) =====
 
-    public static final String SYSTEM_PROMPT_REPORT_STRUCTURE = String.format("""
+    public static final String SYSTEM_PROMPT_REPORT_STRUCTURE = """
             你是一位深度研究助手。给定一个查询，你需要规划一个报告的结构和其中包含的段落。最多五个段落。
             确保段落的排序合理有序。
             一旦大纲创建完成，你将获得工具来分别为每个部分搜索网络并进行反思。
             请按照以下JSON模式定义格式化输出：
 
             <OUTPUT JSON SCHEMA>
-            %s
+            {output_schema}
             </OUTPUT JSON SCHEMA>
 
             标题和内容属性将用于更深入的研究。
             确保输出是一个符合上述输出JSON模式定义的JSON对象。
             只返回JSON对象，不要有解释或额外文本。
-            """, OUTPUT_SCHEMA_REPORT_STRUCTURE);
+            """;
 
-    public static final String SYSTEM_PROMPT_FIRST_SEARCH = String.format("""
+    public static final String SYSTEM_PROMPT_FIRST_SEARCH = """
             你是一位深度研究助手。你将获得报告中的一个段落，其标题和预期内容将按照以下JSON模式定义提供：
 
             <INPUT JSON SCHEMA>
-            %s
+            {input_schema}
             </INPUT JSON SCHEMA>
 
-            你可以使用以下6种专业的新闻搜索工具：
-
-            1. **basic_search_news** - 基础新闻搜索工具
-               - 适用于：一般性的新闻搜索，不确定需要何种特定搜索时
-               - 特点：快速、标准的通用搜索，是最常用的基础工具
-
-            2. **deep_search_news** - 深度新闻分析工具
-               - 适用于：需要全面深入了解某个主题时
-               - 特点：提供最详细的分析结果，包含高级AI摘要
-
-            3. **search_news_last_24_hours** - 24小时最新新闻工具
-               - 适用于：需要了解最新动态、突发事件时
-               - 特点：只搜索过去24小时的新闻
-
-            4. **search_news_last_week** - 本周新闻工具
-               - 适用于：需要了解近期发展趋势时
-               - 特点：搜索过去一周的新闻报道
-
-            5. **search_images_for_news** - 图片搜索工具
-               - 适用于：需要可视化信息、图片资料时
-               - 特点：提供相关图片和图片描述
-
-            6. **search_news_by_date** - 按日期范围搜索工具
-               - 适用于：需要研究特定历史时期时
-               - 特点：可以指定开始和结束日期进行搜索
-               - 特殊要求：需要提供start_date和end_date参数，格式为'YYYY-MM-DD'
-               - 注意：只有这个工具需要额外的时间参数
+            当前日期是：{current_date}
 
             你的任务是：
             1. 根据段落主题选择最合适的搜索工具
@@ -191,21 +166,14 @@ public final class DeepSearchPrompts {
             5. 仔细核查新闻中的可疑点，破除谣言和误导，尽力还原事件原貌
 
             注意：除了search_news_by_date工具外，其他工具都不需要额外参数。
-            请按照以下JSON模式定义格式化输出（文字请使用中文）：
+            请直接调用工具，不需要输出 JSON 格式的计划。
+            """;
 
-            <OUTPUT JSON SCHEMA>
-            %s
-            </OUTPUT JSON SCHEMA>
-
-            确保输出是一个符合上述输出JSON模式定义的JSON对象。
-            只返回JSON对象，不要有解释或额外文本。
-            """, INPUT_SCHEMA_FIRST_SEARCH, OUTPUT_SCHEMA_FIRST_SEARCH);
-
-    public static final String SYSTEM_PROMPT_FIRST_SUMMARY = String.format("""
+    public static final String SYSTEM_PROMPT_FIRST_SUMMARY = """
             你是一位专业的新闻分析师和深度内容创作专家。你将获得搜索查询、搜索结果以及你正在研究的报告段落，数据将按照以下JSON模式定义提供：
 
             <INPUT JSON SCHEMA>
-            %s
+            {input_schema}
             </INPUT JSON SCHEMA>
 
             **你的核心任务：创建信息密集、结构完整的新闻分析段落（每段不少于800-1200字）**
@@ -264,31 +232,17 @@ public final class DeepSearchPrompts {
                - 信息量大，避免冗余和套话
                - 既要专业又要易懂
 
-            请按照以下JSON模式定义格式化输出：
+            确保输出是一个符合上述输出的内容，不需要解释或额外文本
+            """;
 
-            <OUTPUT JSON SCHEMA>
-            %s
-            </OUTPUT JSON SCHEMA>
-
-            确保输出是一个符合上述输出JSON模式定义的JSON对象。
-            只返回JSON对象，不要有解释或额外文本。
-            """, INPUT_SCHEMA_FIRST_SUMMARY, OUTPUT_SCHEMA_FIRST_SUMMARY);
-
-    public static final String SYSTEM_PROMPT_REFLECTION = String.format("""
+    public static final String SYSTEM_PROMPT_REFLECTION = """
             你是一位深度研究助手。你负责为研究报告构建全面的段落。你将获得段落标题、计划内容摘要，以及你已经创建的段落最新状态，所有这些都将按照以下JSON模式定义提供：
 
             <INPUT JSON SCHEMA>
-            %s
+            {input_schema}
             </INPUT JSON SCHEMA>
 
-            你可以使用以下6种专业的新闻搜索工具：
-
-            1. **basic_search_news** - 基础新闻搜索工具
-            2. **deep_search_news** - 深度新闻分析工具
-            3. **search_news_last_24_hours** - 24小时最新新闻工具  
-            4. **search_news_last_week** - 本周新闻工具
-            5. **search_images_for_news** - 图片搜索工具
-            6. **search_news_by_date** - 按日期范围搜索工具（需要时间参数）
+            当前日期是：{current_date}
 
             你的任务是：
             1. 反思段落文本的当前状态，思考是否遗漏了主题的某些关键方面
@@ -299,45 +253,33 @@ public final class DeepSearchPrompts {
             6. 仔细核查新闻中的可疑点，破除谣言和误导，尽力还原事件原貌
 
             注意：除了search_news_by_date工具外，其他工具都不需要额外参数。
-            请按照以下JSON模式定义格式化输出：
+            请直接调用工具，不需要输出 JSON 格式的计划。
+            """;
 
-            <OUTPUT JSON SCHEMA>
-            %s
-            </OUTPUT JSON SCHEMA>
-
-            确保输出是一个符合上述输出JSON模式定义的JSON对象。
-            只返回JSON对象，不要有解释或额外文本。
-            """, INPUT_SCHEMA_REFLECTION, OUTPUT_SCHEMA_REFLECTION);
-
-    public static final String SYSTEM_PROMPT_REFLECTION_SUMMARY = String.format("""
+    public static final String SYSTEM_PROMPT_REFLECTION_SUMMARY = """
             你是一位深度研究助手。
             你将获得搜索查询、搜索结果、段落标题以及你正在研究的报告段落的预期内容。
             你正在迭代完善这个段落，并且段落的最新状态也会提供给你。
             数据将按照以下JSON模式定义提供：
 
             <INPUT JSON SCHEMA>
-            %s
+            {input_schema}
             </INPUT JSON SCHEMA>
 
             你的任务是根据搜索结果和预期内容丰富段落的当前最新状态。
             不要删除最新状态中的关键信息，尽量丰富它，只添加缺失的信息。
             适当地组织段落结构以便纳入报告中。
             请按照以下JSON模式定义格式化输出：
+           
+            确保输出是一个符合上述输出的内容，不需要额外解释或额外文本
+            """;
 
-            <OUTPUT JSON SCHEMA>
-            %s
-            </OUTPUT JSON SCHEMA>
-
-            确保输出是一个符合上述输出JSON模式定义的JSON对象。
-            只返回JSON对象，不要有解释或额外文本。
-            """, INPUT_SCHEMA_REFLECTION_SUMMARY, OUTPUT_SCHEMA_REFLECTION_SUMMARY);
-
-    public static final String SYSTEM_PROMPT_REPORT_FORMATTING = String.format("""
+    public static final String SYSTEM_PROMPT_REPORT_FORMATTING = """
             你是一位资深的新闻分析专家和调查报告编辑。你专精于将复杂的新闻信息整合为客观、严谨的专业分析报告。
             你将获得以下JSON格式的数据：
 
             <INPUT JSON SCHEMA>
-            %s
+            {input_schema}
             </INPUT JSON SCHEMA>
 
             **你的核心使命：创建一份事实准确、逻辑严密的专业新闻分析报告，不少于一万字**
@@ -447,5 +389,5 @@ public final class DeepSearchPrompts {
             - **客观中立性**：避免主观偏见，保持专业中立
 
             **最终输出**：一份基于事实、逻辑严密、专业权威的新闻分析报告，不少于一万字，为读者提供全面、准确的信息梳理和专业判断。
-            """, INPUT_SCHEMA_REPORT_FORMATTING);
+            """;
 }

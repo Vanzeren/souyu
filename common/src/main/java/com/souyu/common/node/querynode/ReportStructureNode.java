@@ -1,5 +1,6 @@
 package com.souyu.common.node.querynode;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.souyu.common.client.TimeContextChatClient;
 import com.souyu.common.node.StateMutationNode;
 import com.souyu.common.prompt.DeepSearchPrompts;
@@ -14,6 +15,7 @@ import lombok.NoArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.chat.prompt.PromptTemplate;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -35,10 +37,14 @@ public class ReportStructureNode extends StateMutationNode<String, List<ReportSt
         logger.info("正在生成报告结构");
         
         // 检查 kwargs 中是否有自定义的 prompt
-        String systemPrompt = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
+        String systemPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
         if (kwargs != null && kwargs.containsKey("system_prompt")) {
-            systemPrompt = (String) kwargs.get("system_prompt");
+            systemPromptTemplate = (String) kwargs.get("system_prompt");
         }
+
+        // 使用 PromptTemplate 替换占位符
+        PromptTemplate promptTemplate = new PromptTemplate(systemPromptTemplate);
+        String systemPrompt = promptTemplate.create(Map.of("output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_REPORT_STRUCTURE)).getContents();
 
         Prompt prompt = PromptBuilder.builder()
                 .system(systemPrompt)
@@ -56,11 +62,13 @@ public class ReportStructureNode extends StateMutationNode<String, List<ReportSt
     @Override
     public State mutateState(String inputData, State state, Map<String, Object> kwargs) {
         // 1. 构建 Prompt
-        // 检查 kwargs 中是否有自定义的 prompt
-        String systemPrompt = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
+        String systemPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
         if (kwargs != null && kwargs.containsKey("system_prompt")) {
-            systemPrompt = (String) kwargs.get("system_prompt");
+            systemPromptTemplate = (String) kwargs.get("system_prompt");
         }
+        
+        PromptTemplate promptTemplate = new PromptTemplate(systemPromptTemplate);
+        String systemPrompt = promptTemplate.create(Map.of("output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_REPORT_STRUCTURE)).getContents();
 
         Prompt prompt = PromptBuilder.builder()
                 .system(systemPrompt)
@@ -79,9 +87,7 @@ public class ReportStructureNode extends StateMutationNode<String, List<ReportSt
         // 5. 更新 State 对象
         state.setQuery(inputData);
 
-        // FIX: Use enhanced for-loop and convert to the correct Paragraph type
         for (Paragraph nodeParagraph : validatedStructure) {
-            // Create an instance of the State's Paragraph and add it
             state.addParagraph(nodeParagraph.getTitle(), nodeParagraph.getContent());
         }
 
@@ -146,6 +152,7 @@ public class ReportStructureNode extends StateMutationNode<String, List<ReportSt
     @Data
     @NoArgsConstructor
     @AllArgsConstructor
+    @JsonIgnoreProperties(ignoreUnknown = true) // 忽略未知字段
     public static class Paragraph {
         private String title;
         private String content;

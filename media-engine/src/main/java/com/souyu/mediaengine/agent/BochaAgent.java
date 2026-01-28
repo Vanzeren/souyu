@@ -3,9 +3,7 @@ package com.souyu.mediaengine.agent;
 import com.souyu.common.agent.AbstractAgent;
 import com.souyu.common.config.AgentConfig;
 import com.souyu.common.bocha.BochaClient;
-import com.souyu.common.bocha.model.BochaResponse;
-import com.souyu.common.bocha.model.WebResult;
-import com.souyu.common.prompt.BochaPrompts;
+import com.souyu.common.tavily.model.TavilyResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,7 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 @Component
-public class BochaAgent extends AbstractAgent<BochaResponse, Object> {
+public class BochaAgent extends AbstractAgent<TavilyResponse> {
 
     private static final Logger logger = LoggerFactory.getLogger(BochaAgent.class);
 
@@ -33,99 +31,44 @@ public class BochaAgent extends AbstractAgent<BochaResponse, Object> {
     @Override
     public String engineName(){return "media";}
 
+    // 移除 getPrompts()，使用父类统一的 DeepSearchPrompts
+
     @Override
-    public BochaResponse executeSearchTool(String toolName, String query, Map<String, Object> kwargs) {
-        logger.info("  → Bocha 执行搜索工具: {}", toolName);
-        
-        if (toolName == null) {
-            logger.warn("  ⚠️  工具名称为空，使用默认综合搜索");
-            return bochaClient.comprehensiveSearch(query, 10);
-        }
+    protected String[] getToolNames() {
+        // 确保这里的名称与 BochaToolsConfig 中的 Bean 名称一致 (驼峰命名)
+        return new String[]{
+            "comprehensiveSearch",
+            "webSearchOnly",
+            "searchForStructuredData",
+            "searchLast24Hours",
+            "searchLastWeek"
+        };
+    }
+    
+    // 移除 getToolDescription()
 
-        switch (toolName) {
-            case "comprehensive_search":
-                int maxResultsComp = 10;
-                if (kwargs != null && kwargs.containsKey("max_results")) {
-                    try {
-                        maxResultsComp = Integer.parseInt(kwargs.get("max_results").toString());
-                    } catch (NumberFormatException e) {
-                        logger.warn("max_results 参数格式错误，使用默认值 10");
-                    }
-                }
-                return bochaClient.comprehensiveSearch(query, maxResultsComp);
-
-            case "web_search_only":
-                int maxResultsWeb = 15;
-                if (kwargs != null && kwargs.containsKey("max_results")) {
-                    try {
-                        maxResultsWeb = Integer.parseInt(kwargs.get("max_results").toString());
-                    } catch (NumberFormatException e) {
-                        logger.warn("max_results 参数格式错误，使用默认值 15");
-                    }
-                }
-                return bochaClient.webSearchOnly(query, maxResultsWeb);
-
-            case "search_for_structured_data":
-                return bochaClient.searchForStructuredData(query);
-
-            case "search_last_24_hours":
-                return bochaClient.searchLast24Hours(query);
-
-            case "search_last_week":
-                return bochaClient.searchLastWeek(query);
-
-            default:
-                logger.warn("  ⚠️  未知的搜索工具: {}，使用默认综合搜索", toolName);
-                return bochaClient.comprehensiveSearch(query, 10);
-        }
+    @Override
+    public TavilyResponse executeSearchTool(String toolName, String query, Map<String, Object> kwargs) {
+        logger.debug("executeSearchTool called (Legacy path): {}", toolName);
+        return null;
     }
 
     @Override
-    protected List<Map<String, Object>> extractSearchResults(BochaResponse response) {
-        List<Map<String, Object>> results = new ArrayList<>();
-
-        if (response == null || response.getWebpages() == null) {
-            return results;
+    protected List<Map<String, Object>> extractSearchResults(TavilyResponse response) {
+        // 注意：这里的 response 实际上是 BochaToolsConfig 中转换后的 TavilyResponse
+        if (response == null || response.getResults() == null) {
+            return new ArrayList<>();
         }
 
-        for (WebResult webResult : response.getWebpages()) {
+        List<Map<String, Object>> resultsMap = new ArrayList<>();
+        for (var result : response.getResults()) {
             Map<String, Object> map = new HashMap<>();
-
-            // 字段映射：将 Bocha 的 WebResult 映射到 AbstractAgent 期望的标准字段
-            map.put("title", webResult.getName());
-            map.put("url", webResult.getUrl());
-            map.put("content", webResult.getSnippet());
-            map.put("published_date", webResult.getDatePublished());
-
-            // Bocha 特有字段也可以保留，供后续可能使用
-            map.put("site_name", webResult.getSiteName());
-            map.put("site_icon", webResult.getSiteIcon());
-
-            results.add(map);
+            map.put("title", result.getTitle());
+            map.put("url", result.getUrl());
+            map.put("content", result.getContent());
+            map.put("published_date", result.getPublishedDate());
+            resultsMap.add(map);
         }
-
-        return results;
-    }
-
-    /**
-     * 获取 Prompt 映射的方法，允许子类覆盖默认 Prompt
-     * 支持的 key 包括:
-     * - "report_structure": 生成报告结构的 Prompt
-     * - "first_search": 首次搜索的 Prompt
-     * - "first_summary": 首次总结的 Prompt
-     * - "reflection": 反思阶段的 Prompt
-     * - "reflection_summary": 反思总结阶段的 Prompt
-     * - "report_formatting": 最终报告格式化的 Prompt
-     */
-    @Override
-    protected Map<String,String> getPrompts(){
-        HashMap<String,String> prompts = new HashMap<>();
-        prompts.put("report_structure", BochaPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE);
-        prompts.put("first_search",BochaPrompts.SYSTEM_PROMPT_FIRST_SEARCH);
-        prompts.put("first_summary",BochaPrompts.SYSTEM_PROMPT_FIRST_SUMMARY);
-        prompts.put("reflection",BochaPrompts.SYSTEM_PROMPT_REFLECTION);
-        prompts.put("reflection_summary",BochaPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY);
-        prompts.put("report_formatting",BochaPrompts.SYSTEM_PROMPT_REPORT_FORMATTING);
-        return prompts;
+        return resultsMap;
     }
 }

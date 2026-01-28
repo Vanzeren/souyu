@@ -1,5 +1,6 @@
 package com.souyu.queryengine.agent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.agent.AbstractAgent;
 import com.souyu.common.config.AgentConfig;
 import com.souyu.common.tavily.TavilyClient;
@@ -17,7 +18,7 @@ import java.util.List;
 import java.util.Map;
 
 @Component
-public class QueryAgent extends AbstractAgent<TavilyResponse, Object> {
+public class QueryAgent extends AbstractAgent<TavilyResponse> {
 
     private static final Logger logger = LoggerFactory.getLogger(QueryAgent.class);
 
@@ -26,6 +27,8 @@ public class QueryAgent extends AbstractAgent<TavilyResponse, Object> {
 
     @Autowired
     private QueryEngineConfig queryEngineConfig;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
     public String engineName(){return "query";}
@@ -51,57 +54,26 @@ public class QueryAgent extends AbstractAgent<TavilyResponse, Object> {
         return config;
     }
 
+    // 移除 getPrompts()，使用父类统一的 DeepSearchPrompts
+
+    @Override
+    protected String[] getToolNames() {
+        return new String[]{
+            "basicSearchNews", 
+            "deepSearchNews",
+            "searchNewsLast24Hours",
+            "searchNewsLastWeek",
+            "searchImagesForNews",
+            "searchNewsByDate"
+        };
+    }
+    
+    // 移除 getToolDescription()
+
     @Override
     public TavilyResponse executeSearchTool(String toolName, String query, Map<String, Object> kwargs) {
-        logger.info("  → 执行搜索工具: {}", toolName);
-
-        if (toolName == null) {
-            logger.warn("  ⚠️  工具名称为空，使用默认基础搜索");
-            return tavilyClient.basicSearchNews(query);
-        }
-
-        switch (toolName) {
-            case "basic_search_news":
-                int maxResults = 7;
-                if (kwargs != null && kwargs.containsKey("max_results")) {
-                    try {
-                        maxResults = Integer.parseInt(kwargs.get("max_results").toString());
-                    } catch (NumberFormatException e) {
-                        logger.warn("max_results 参数格式错误，使用默认值 7");
-                    }
-                }
-                return tavilyClient.basicSearchNews(query, maxResults);
-
-            case "deep_search_news":
-                return tavilyClient.deepSearchNews(query);
-
-            case "search_news_last_24_hours":
-                return tavilyClient.searchNewsLast24Hours(query);
-
-            case "search_news_last_week":
-                return tavilyClient.searchNewsLastWeek(query);
-
-            case "search_images_for_news":
-                return tavilyClient.searchImagesForNews(query);
-
-            case "search_news_by_date":
-                String startDate = kwargs != null ? (String) kwargs.get("start_date") : null;
-                String endDate = kwargs != null ? (String) kwargs.get("end_date") : null;
-
-                if (startDate == null || endDate == null) {
-                    throw new IllegalArgumentException("search_news_by_date工具需要start_date和end_date参数");
-                }
-
-                if (!validateDateFormat(startDate) || !validateDateFormat(endDate)) {
-                    throw new IllegalArgumentException("日期格式错误，应为 YYYY-MM-DD");
-                }
-
-                return tavilyClient.searchNewsByDate(query, startDate, endDate);
-
-            default:
-                logger.warn("  ⚠️  未知的搜索工具: {}，使用默认基础搜索", toolName);
-                return tavilyClient.basicSearchNews(query);
-        }
+        logger.debug("executeSearchTool called (Legacy path): {}", toolName);
+        return null; 
     }
 
     @Override

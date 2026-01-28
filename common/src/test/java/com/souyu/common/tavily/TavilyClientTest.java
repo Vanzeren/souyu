@@ -62,7 +62,7 @@ class TavilyClientTest {
                     .thenReturn(mockResponse);
 
             // Act
-            TavilyResponse response = tavilyClient.basicSearchNews(query);
+            TavilyResponse response = tavilyClient.basicSearchNews(query,7);
 
             // Print Result
             System.out.println("--------------------------------------------------");
