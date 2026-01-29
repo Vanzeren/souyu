@@ -131,8 +131,114 @@ public final class DeepSearchPrompts {
                 }
             }
             """;
+
+    public static final String OUT_PUT_SCHEMA_REPORT_STRUCTURE_SEARCHING= """
+            {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "title": "PublicOpinionBriefing",
+              "type": "object",
+              "description": "舆情分析深度简报结构化数据，用于后续报告段落规划",
+              "properties": {
+                "event_snapshot": {
+                  "type": "object",
+                  "description": "事件全景概览",
+                  "properties": {
+                    "summary": { "type": "string", "description": "100字以内的事件核心总结" },
+                    "hotness_level": { "type": "string", "description": "热度等级，如：全网爆发、行业关注、局部发酵" },
+                    "lifecycle_stage": {
+                      "type": "string",
+                      "enum": ["潜伏期", "爆发期", "平台期", "衰退期"],
+                      "description": "当前舆情所处的阶段"
+                    }
+                  },
+                  "required": ["summary", "hotness_level", "lifecycle_stage"]
+                },
+                "fact_line": {
+                  "type": "array",
+                  "description": "按时间顺序排列的关键事实链条",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "timestamp": { "type": "string", "description": "事件发生的时间点" },
+                      "event_description": { "type": "string", "description": "具体动作或事实描述" },
+                      "source_authority": { "type": "string", "description": "信源（如：官媒、当事人微博、知情人爆料）" }
+                    },
+                    "required": ["timestamp", "event_description"]
+                  }
+                },
+                "stakeholders": {
+                  "type": "array",
+                  "description": "利益相关方立场拆解",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "identity": { "type": "string", "description": "角色身份（如：官方、大众、媒体、品牌方）" },
+                      "stance": { "type": "string", "description": "核心态度或立场诉求" },
+                      "influence_weight": { "type": "integer", "minimum": 1, "maximum": 10, "description": "对舆情走向的影响力权重" }
+                    },
+                    "required": ["identity", "stance"]
+                  }
+                },
+                "fact_check": {
+                  "type": "object",
+                  "description": "真相核实与争议点",
+                  "properties": {
+                    "key_controversies": { "type": "array", "items": { "type": "string" }, "description": "目前核心的矛盾争议点" },
+                    "debunked_rumors": { "type": "array", "items": { "type": "string" }, "description": "已被识别并破除的谣言或误导性信息" },
+                    "unverified_points": { "type": "array", "items": { "type": "string" }, "description": "尚未证实但对报告关键的疑点" }
+                  }
+                },
+                "planning_insights": {
+                  "type": "object",
+                  "description": "为后续段落规划提供的逻辑建议",
+                  "properties": {
+                    "potential_risks": { "type": "array", "items": { "type": "string" }, "description": "可能的次生舆情风险" },
+                    "suggested_report_angles": { "type": "array", "items": { "type": "string" }, "description": "建议报告切入的角度" }
+                  }
+                }
+              },
+              "required": ["event_snapshot", "fact_line", "stakeholders", "fact_check", "planning_insights"]
+            }
+            """;
             
     // ===== 系统提示词定义 (修改为使用占位符，移除 String.format) =====
+    public static final String SYSTEM_PROMPT_REPORT_SEARCHING_STRUCTURE= """
+            你是一位深度研究助手。给定一个查询，你需要规划一个报告的结构和其中包含的段落。但由于你可能没有当前实时的知识储备，所以暂时先根据user的prompt通过工具搜索一些相关信息，并生成一个简报共后续实际段落规划使用。
+           
+            输出请严格按照以下JSON_SCHEMA：
+            <OUTPUT JSON SCHEMA>
+           {output_schema}
+            </OUTPUT JSON SCHEMA>
+           
+            **你的核心目标是：** 通过全网搜索获取实时、多维的信息，并将其加工成一份**高度结构化的《舆情深度分析简报》**。请按以下步骤执行：
+           
+             1. **多维解构与需求识别：**
+                 * 分析用户给定的查询（Query），识别舆情核心（事件主体、涉及方、关键争议）。
+                 * 评估当前已知信息的广度与深度，确定需要重点搜寻的“信息盲区”（例如：官方通报、外媒视角、民间情绪拐点、是否存在反转证据等）。
+           
+             2. **制定高精度的搜索策略：**
+                 * 设计针对性强的搜索词，涵盖：新闻门户（权威性）、社交媒体（实时情绪）、行业分析/评论（深度见解）。
+                 * **[技术约束]**：若使用 `search_news_by_date` 工具，**必须**严格遵守 `YYYY-MM-DD` 格式提供 `start_date` 和 `end_date`（例如：2026-01-20）。
+           
+           
+             3. **多源验证与“脱水”处理：**
+                 * **真实性校验：** 对比不同信源（如官媒 vs. 自媒体），剔除营销号的煽动性词汇和无依据的臆测。
+                 * **破除噪声：** 特别关注是否存在反转细节、谣言或过时的旧闻误导。
+                 * **提取核心变量：** 提取关键时间节点、量化数据（热度、阅读量）、核心冲突点。
+           
+           
+             4. **生成《舆情深度分析简报》：**
+                 * **严禁**输出大段散乱的搜索结果。
+                 * **必须**按照以下结构输出，以便后续“段落规划”使用：
+                 * **【事件全景图】**：一句话定义事件性质及当前所处阶段（爆发/发酵/平息）。
+                 * **【事实链条】**：按时间顺序梳理核心动作，标注已证实的细节。
+                 * **【舆论场博弈】**：拆解各方利益相关者（官方、当事人、媒体、网民）的立场与核心诉求。
+                 * **【风险与矛盾点】**：指出当前最容易引发次生灾害或后续讨论的“火药桶”点。
+           
+           
+             5. **推理说明：**
+             * 在简报末尾简要解释你选择这些搜索方向的逻辑，以及为什么这些信息对后续“报告结构设计”至关重要。
+            """;
 
     public static final String SYSTEM_PROMPT_REPORT_STRUCTURE = """
             你是一位深度研究助手。给定一个查询，你需要规划一个报告的结构和其中包含的段落。最多五个段落。
@@ -232,7 +338,7 @@ public final class DeepSearchPrompts {
                - 信息量大，避免冗余和套话
                - 既要专业又要易懂
 
-            确保输出是一个符合上述输出的内容，不需要解释或额外文本
+            确保输出是一个符合上述输出的内容，严格按照结构化内容组织，不需要解释或额外文本
             """;
 
     public static final String SYSTEM_PROMPT_REFLECTION = """
@@ -271,7 +377,7 @@ public final class DeepSearchPrompts {
             适当地组织段落结构以便纳入报告中。
             请按照以下JSON模式定义格式化输出：
            
-            确保输出是一个符合上述输出的内容，不需要额外解释或额外文本
+            确保输出是一个符合上述输出的内容，严格按照结构化内容组织，不需要额外解释或额外文本
             """;
 
     public static final String SYSTEM_PROMPT_REPORT_FORMATTING = """

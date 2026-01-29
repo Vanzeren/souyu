@@ -44,8 +44,6 @@ public abstract class AbstractAgent<R> {
     @Autowired
     private QueryFormattingNode queryFormattingNode;
 
-    @Autowired
-    private RedisTemplate redisTemplate;
 
     protected abstract AgentConfig getAgentConfig();
 
@@ -71,7 +69,7 @@ public abstract class AbstractAgent<R> {
         // 显式初始化 State，确保 taskId 和 query 被正确记录
         // stateManager.initState(taskId, query); // 移除显式初始化，避免覆盖
 
-        logger.info("\n============================================================");
+        logger.info("============================================================");
         logger.info("开始深度研究: {}", query);
         logger.info("============================================================");
 
@@ -107,7 +105,7 @@ public abstract class AbstractAgent<R> {
 
             producer.triggerMasterReport(taskId, engineName());
 
-            logger.info("\n============================================================");
+            logger.info("============================================================");
             logger.info("深度研究完成！");
             logger.info("============================================================");
 
@@ -141,8 +139,6 @@ public abstract class AbstractAgent<R> {
     public void generateReportStructure(State state, String query) {
         logger.info("正在生成报告结构...");
 
-        // 直接使用 DeepSearchPrompts
-        String customPrompt = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
         Map<String, Object> kwargs = new HashMap<>();
         // 如果需要支持自定义 Prompt，可以在这里处理，但目前统一使用 DeepSearchPrompts
 

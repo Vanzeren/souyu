@@ -14,8 +14,11 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.chat.prompt.PromptTemplate;
+import org.springframework.ai.retry.NonTransientAiException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -23,45 +26,47 @@ import java.util.List;
 import java.util.Map;
 
 @Component
-public class ReportStructureNode extends StateMutationNode<String, List<ReportStructureNode.Paragraph>> {
+public class ReportStructureNode  {
 
     private static final Logger logger = LoggerFactory.getLogger(ReportStructureNode.class);
     private static final ObjectMapper mapper = new ObjectMapper();
+    
+    @Autowired
+    private TimeContextChatClient chatClient;
 
-    public ReportStructureNode(TimeContextChatClient chatClient) {
-        super(chatClient, "ReportStructureNode");
-    }
-
-    @Override
-    public List<Paragraph> run(String inputData, Map<String, Object> kwargs) {
-        logger.info("正在生成报告结构");
-        
-        // 检查 kwargs 中是否有自定义的 prompt
-        String systemPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
+    public State mutateState(String inputData, State state, Map<String, Object> kwargs,String... toolsNames) {
+        // 1. 构建 Prompt
+        String systemSearchingPromptTemplate =DeepSearchPrompts.SYSTEM_PROMPT_REPORT_SEARCHING_STRUCTURE;
         if (kwargs != null && kwargs.containsKey("system_prompt")) {
-            systemPromptTemplate = (String) kwargs.get("system_prompt");
-        }
-
-        // 使用 PromptTemplate 替换占位符
-        PromptTemplate promptTemplate = new PromptTemplate(systemPromptTemplate);
-        String systemPrompt = promptTemplate.create(Map.of("output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_REPORT_STRUCTURE)).getContents();
-
-        Prompt prompt = PromptBuilder.builder()
-                .system(systemPrompt)
+            systemSearchingPromptTemplate = (String) kwargs.get("system_prompt");
+        } 
+        PromptTemplate searchingTemplate =new PromptTemplate(systemSearchingPromptTemplate);
+        String systemSearchingPrompt = searchingTemplate.create(Map.of("output_schema", DeepSearchPrompts.OUT_PUT_SCHEMA_REPORT_STRUCTURE_SEARCHING)).getContents();
+        Prompt searchingPrompt = PromptBuilder.builder()
+                .system(systemSearchingPrompt)
                 .user(inputData)
                 .build();
-        String rawOutput = this.chatClient.streamAndCollect(prompt).block();
 
-        // 3. 清理和解析原始输出
-        Object parsedOutput = TextProcessing.extractCleanResponse(rawOutput);
+        String reasoning = "";
 
-        // 4. 验证和清理结构
-        return processOutput(parsedOutput);
-    }
+        try {
+            // 使用 TimeContextChatClient 的 callWithFunctions 方法
+            // 这样可以复用时间注入逻辑，并且支持 Function Calling
+            ChatResponse response = chatClient.callWithFunctions(
+                    searchingPrompt, 
+                    toolsNames // 使用动态工具列表
+            );
 
-    @Override
-    public State mutateState(String inputData, State state, Map<String, Object> kwargs) {
-        // 1. 构建 Prompt
+            // 记录 Reasoning (思考过程)
+            reasoning = response.getResult().getOutput().getContent();
+            if (reasoning != null && !reasoning.isBlank()) {
+                logger.info("Reasoning (思考过程):\n{}", reasoning);
+            }
+
+        } catch (NonTransientAiException e) {
+            logger.error("由于内容安全风险，跳过该段落搜索: {}", e.getMessage());
+        }
+        
         String systemPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REPORT_STRUCTURE;
         if (kwargs != null && kwargs.containsKey("system_prompt")) {
             systemPromptTemplate = (String) kwargs.get("system_prompt");
@@ -70,9 +75,14 @@ public class ReportStructureNode extends StateMutationNode<String, List<ReportSt
         PromptTemplate promptTemplate = new PromptTemplate(systemPromptTemplate);
         String systemPrompt = promptTemplate.create(Map.of("output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_REPORT_STRUCTURE)).getContents();
 
+        String finalInput = inputData;
+        if (reasoning != null && !reasoning.isBlank()) {
+            finalInput = "User Query: " + inputData + "\n\nBriefing:\n" + reasoning;
+        }
+
         Prompt prompt = PromptBuilder.builder()
                 .system(systemPrompt)
-                .user(inputData)
+                .user(finalInput)
                 .build();
 
         // 2. 调用大模型
