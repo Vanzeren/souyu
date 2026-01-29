@@ -60,7 +60,7 @@ public class ReportRequestConsumer implements StreamListener<String, MapRecord<S
                     reports,
                     forumLogs,
                     null,
-                    (eventType, payload) -> logger.info("Report progress [{}]: {} - {}", taskId, eventType, payload)
+                   (eventType, payload) -> logger.info("Report progress [{}]: {} - {}", taskId, eventType, payload)
             );
 
             // 保存报告

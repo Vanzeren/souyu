@@ -273,8 +273,45 @@ public class JsonParser {
             logger.warn("检测到单引号，已自动替换为双引号");
             mutated = true;
         }
+        
+        // 新增：修复数组误用为对象的情况
+        Map.Entry<String, Boolean> arrayAsObjectResult = fixArrayAsObject(repaired);
+        if (arrayAsObjectResult.getValue()) {
+            repaired = arrayAsObjectResult.getKey();
+            logger.warn("检测到数组误用为对象（[]包含键值对），已自动转换为对象{}");
+            mutated = true;
+        }
 
         return mutated ? repaired : text;
+    }
+    
+    private Map.Entry<String, Boolean> fixArrayAsObject(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        String trimmed = text.trim();
+        // 检查是否以 [ 开头，以 ] 结尾
+        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            // 检查内部是否直接包含 "key": 结构
+            // 这是一个简单的启发式检查：查找第一个 " 后的 :
+            int firstQuote = trimmed.indexOf('"');
+            if (firstQuote != -1) {
+                int afterQuote = trimmed.indexOf('"', firstQuote + 1);
+                if (afterQuote != -1) {
+                    int colon = trimmed.indexOf(':', afterQuote);
+                    // 确保中间没有逗号或其他干扰，且冒号确实存在
+                    if (colon != -1) {
+                        String between = trimmed.substring(afterQuote + 1, colon);
+                        if (between.trim().isEmpty()) {
+                            // 确实是 [ "key" : ... 模式
+                            // 将首尾的 [] 替换为 {}
+                            String repaired = "{" + trimmed.substring(1, trimmed.length() - 1) + "}";
+                            return Map.entry(repaired, true);
+                        }
+                    }
+                }
+            }
+        }
+        return Map.entry(text, false);
     }
 
     private Map.Entry<String, Boolean> fixSingleQuotes(String text) {
