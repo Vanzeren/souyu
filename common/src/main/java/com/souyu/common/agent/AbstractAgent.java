@@ -77,15 +77,16 @@ public abstract class AbstractAgent<R> {
             checkIfCancelled(taskId);
 
             stateManager.executeUpdate(taskId, state -> generateReportStructure(state, query));
+            taskStatusManager.refreshUpdateTime(taskId);
 
             State currentState = stateManager.getState(taskId);
             int totalParagraphs = currentState.getParagraphs().size();
 
             for (int i = 0; i < totalParagraphs; i++) {
                 checkIfCancelled(taskId);
-                taskStatusManager.refreshUpdateTime(taskId);
                 try {
                     processParagraph(taskId, i);
+                    taskStatusManager.refreshUpdateTime(taskId);
                 } catch (Exception e) {
                     if (e instanceof RuntimeException && "Task cancelled".equals(e.getMessage())) {
                         throw e;
@@ -101,6 +102,7 @@ public abstract class AbstractAgent<R> {
             if (saveReport) {
                 State finalState = stateManager.getState(taskId);
                 saveReport(taskId, finalState, finalReport, engineName());
+                taskStatusManager.refreshUpdateTime(taskId);
             }
 
             producer.triggerMasterReport(taskId, engineName());
@@ -129,7 +131,7 @@ public abstract class AbstractAgent<R> {
     }
 
     private void checkIfCancelled(String taskId) {
-        if (taskControlManager.isCancelled(taskId)) {
+        if (taskControlManager.isCancelled(taskId, engineName())) {
             throw new RuntimeException("Task cancelled");
         }
     }
@@ -261,13 +263,13 @@ public abstract class AbstractAgent<R> {
         try {
             // 使用 TimeContextChatClient 的 callWithFunctions 方法
             // 这样可以复用时间注入逻辑，并且支持 Function Calling
-            ChatResponse response = chatClient.callWithFunctions(
+            ChatResponse chatResponse = chatClient.callWithFunctions(
                     new org.springframework.ai.chat.prompt.Prompt(userPrompt),
                     getToolNames() // 使用动态工具列表
             );
 
             // 记录 Reasoning (思考过程)
-            String reasoning = response.getResult().getOutput().getContent();
+            String reasoning = chatResponse.getResult().getOutput().getContent();
             if (reasoning != null && !reasoning.isBlank()) {
                 logger.info("Reasoning (思考过程):\n{}", reasoning);
             }

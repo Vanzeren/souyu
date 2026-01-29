@@ -4,10 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.TaskStatus.TaskStatus;
 import com.souyu.common.manager.ReportDocument;
 import com.souyu.common.manager.StateDocument;
+import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.producer.messageProducer;
 import com.souyu.orchestrator.client.MediaEngineClient;
 import com.souyu.orchestrator.client.QueryEngineClient;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +23,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Component
 @EnableScheduling
@@ -31,6 +35,9 @@ public class TaskTimeoutMonitor {
 
     @Autowired
     private TaskStatusManager taskStatusManager;
+    
+    @Autowired
+    private TaskControlManager taskControlManager;
 
     @Autowired
     private QueryEngineClient queryEngineClient;
@@ -44,6 +51,9 @@ public class TaskTimeoutMonitor {
     @Autowired
     private MongoTemplate mongoTemplate;
     
+    @Autowired
+    private RedissonClient redissonClient;
+    
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
@@ -56,44 +66,83 @@ public class TaskTimeoutMonitor {
         // 1. 检查卡在 RESEARCHING 的任务
         List<TaskStatus> researchingTasks = taskStatusManager.findStuckTasks(TaskStatus.Status.RESEARCHING, TIMEOUT_MINUTES);
         for (TaskStatus task : researchingTasks) {
-            handleResearchingTimeout(task);
+            processTaskWithLock(task, this::handleResearchingTimeout);
         }
 
         // 2. 检查卡在 SUMMARIZING 的任务
         List<TaskStatus> summarizingTasks = taskStatusManager.findStuckTasks(TaskStatus.Status.SUMMARIZING, TIMEOUT_MINUTES);
         for (TaskStatus task : summarizingTasks) {
-            handleSummarizingTimeout(task);
+            processTaskWithLock(task, this::handleSummarizingTimeout);
         }
         
         // 3. 检查卡在 GENERATING 的任务
         List<TaskStatus> generatingTasks = taskStatusManager.findStuckTasks(TaskStatus.Status.GENERATING, TIMEOUT_MINUTES);
         for (TaskStatus task : generatingTasks) {
-            handleGeneratingTimeout(task);
+            processTaskWithLock(task, this::handleGeneratingTimeout);
+        }
+    }
+    
+    private void processTaskWithLock(TaskStatus task, java.util.function.Consumer<TaskStatus> handler) {
+        String taskId = task.getTaskId();
+        RLock lock = redissonClient.getLock("lock:orchestrator:event:" + taskId);
+        try {
+            // 尝试获取锁，等待 500ms，持有 10s
+            if (lock.tryLock(500, 10000, TimeUnit.MILLISECONDS)) {
+                try {
+                    // 再次检查状态，防止在等待锁的过程中状态已变更
+                    TaskStatus currentStatus = taskStatusManager.getTaskStatus(taskId);
+                    if (currentStatus != null) {
+                        handler.accept(currentStatus);
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            } else {
+                logger.warn("Could not acquire lock for task {} during timeout check. Skipping.", taskId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.error("Interrupted while waiting for lock for task {}", taskId);
+        } catch (Exception e) {
+            logger.error("Error processing timeout for task {}", taskId, e);
         }
     }
 
     private void handleResearchingTimeout(TaskStatus task) {
-        // 检查是否有 Worker 已经失败
         Map<String, TaskStatus.WorkerStatus> workers = task.getWorkerStatus();
-        boolean anyWorkerFailed = workers.values().stream()
-                .anyMatch(status -> status == TaskStatus.WorkerStatus.FAILED);
-        
-        if (anyWorkerFailed) {
-            logger.error("Task {} has failed workers. Marking task as FAILED.", task.getTaskId());
-            taskStatusManager.markTaskFailed(task.getTaskId(), "One or more workers failed during RESEARCHING phase");
-            return;
-        }
+
+        // 策略优化：不再因为单个 Worker 失败就直接失败整个任务
+        // 而是先尝试重试，重试耗尽后尝试“部分成功”继续执行
 
         if (task.getRetryCount() >= MAX_RETRIES) {
+            // 检查是否有任意 Worker 完成
+            boolean anyWorkerCompleted = workers.values().stream()
+                    .anyMatch(status -> status == TaskStatus.WorkerStatus.COMPLETED);
+
+            if (anyWorkerCompleted) {
+                logger.warn("Task {} stuck/failed in RESEARCHING and exceeded max retries. Proceeding with partial results.", task.getTaskId());
+                // 推进到下一阶段 (SUMMARIZING)
+                taskStatusManager.updateMainStatus(task.getTaskId(), TaskStatus.Status.SUMMARIZING);
+
+                // 触发 Forum (下一阶段任务)
+                producer.sendMessage("forum", Map.of(
+                        "taskId", task.getTaskId(),
+                        "type", "FINAL_CHECK",
+                        "engine", "MASTER"
+                ));
+                return;
+            }
+
+            // 如果所有 Worker 都没完成，才标记为失败
             logger.error("Task {} stuck in RESEARCHING and exceeded max retries. Marking as FAILED.", task.getTaskId());
-            taskStatusManager.markTaskFailed(task.getTaskId(), "Timeout in RESEARCHING phase after " + MAX_RETRIES + " retries");
+            taskStatusManager.markTaskFailed(task.getTaskId(), "Timeout/Failure in RESEARCHING phase after " + MAX_RETRIES + " retries");
             return;
         }
 
-        logger.warn("Task {} stuck in RESEARCHING. Attempting recovery (Retry {}/{})", task.getTaskId(), task.getRetryCount() + 1, MAX_RETRIES);
+        logger.warn("Task {} stuck or has failed workers in RESEARCHING. Attempting recovery (Retry {}/{})", task.getTaskId(), task.getRetryCount() + 1, MAX_RETRIES);
         taskStatusManager.incrementRetryCount(task.getTaskId());
 
-        // 检查哪个 Worker 没完成，重新触发
+        // 重新触发未完成（包括 FAILED）的 Worker
         String query = getQuery(task.getTaskId());
         if (query == null) {
              logger.error("Cannot recover task {}: Query not found", task.getTaskId());
@@ -104,6 +153,8 @@ public class TaskTimeoutMonitor {
 
         if (workers.get("query") != TaskStatus.WorkerStatus.COMPLETED) {
             logger.info("Resubmitting Query Engine task for {}", task.getTaskId());
+            // 关键修复：重试前必须撤销取消标记，否则 Worker 启动即死
+            taskControlManager.revokeCancelCommand(task.getTaskId(), "query");
             try {
                 queryEngineClient.submitQuery(request);
             } catch (Exception e) {
@@ -113,6 +164,8 @@ public class TaskTimeoutMonitor {
 
         if (workers.get("media") != TaskStatus.WorkerStatus.COMPLETED) {
             logger.info("Resubmitting Media Engine task for {}", task.getTaskId());
+            // 关键修复：重试前必须撤销取消标记
+            taskControlManager.revokeCancelCommand(task.getTaskId(), "media");
             try {
                 mediaEngineClient.submitMediaSearch(request);
             } catch (Exception e) {

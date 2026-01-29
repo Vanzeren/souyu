@@ -72,29 +72,7 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
             if ("WORKER_COMPLETED".equals(eventType)) {
                 // 更新 Worker 状态
                 taskStatusManager.updateWorkerStatus(taskId, source, TaskStatus.WorkerStatus.COMPLETED);
-                
-                // 重新获取状态以检查是否全部完成
-                status = taskStatusManager.getTaskStatus(taskId);
-                boolean allWorkersDone = checkAllWorkersDone(status);
-                
-                if (allWorkersDone) {
-                    logger.info("All workers completed for task {}. Checking Forum status...", taskId);
-                    
-                    if (status.getForumStatus() == TaskStatus.WorkerStatus.COMPLETED) {
-                        startGeneratingReport(taskId);
-                    } else {
-                        logger.info("Triggering final summary check for Forum on task {}", taskId);
-                        producer.sendMessage("forum", Map.of(
-                                "taskId", taskId,
-                                "type", "FINAL_CHECK",
-                                "engine", "MASTER"
-                        ));
-                        
-                        if (status.getStatus() != TaskStatus.Status.SUMMARIZING) {
-                            taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.SUMMARIZING);
-                        }
-                    }
-                }
+                checkAndProceed(taskId);
             }
             // 场景 2: Worker 失败
             else if ("WORKER_FAILED".equals(eventType)) {
@@ -104,22 +82,16 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
                 // 更新 Worker 状态
                 taskStatusManager.updateWorkerStatus(taskId, source, TaskStatus.WorkerStatus.FAILED);
                 
-                // 标记任务失败并广播取消
-                taskStatusManager.markTaskFailed(taskId, "Worker " + source + " failed: " + error);
-                taskControlManager.sendCancelCommand(taskId);
+                // 仅取消该 Engine，而不是整个任务
+                taskControlManager.sendCancelCommand(taskId, source);
+                
+                checkAndProceed(taskId);
             }
             // 场景 3: Forum 完成
             else if ("FORUM_COMPLETED".equals(eventType)) {
                 // 更新 Forum 状态
                 taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                
-                // 重新获取状态
-                status = taskStatusManager.getTaskStatus(taskId);
-                if (checkAllWorkersDone(status)) {
-                    startGeneratingReport(taskId);
-                } else {
-                    logger.info("Forum completed, but waiting for other workers for task {}", taskId);
-                }
+                checkAndProceed(taskId);
             }
             // 场景 4: 报告生成完成
             else if ("REPORT_COMPLETED".equals(eventType)) {
@@ -142,13 +114,57 @@ public class MasterStreamListener implements StreamListener<String, MapRecord<St
         }
     }
     
-    private boolean checkAllWorkersDone(TaskStatus status) {
+    /**
+     * 检查所有 Worker 的状态，并决定是否推进任务
+     * 支持部分成功策略：只要有一个 Worker 成功，且所有 Worker 都已结束（成功或失败），就继续。
+     */
+    private void checkAndProceed(String taskId) {
+        TaskStatus status = taskStatusManager.getTaskStatus(taskId);
         Map<String, TaskStatus.WorkerStatus> workers = status.getWorkerStatus();
-        if (workers == null) return false;
+        if (workers == null) return;
+
+        boolean allEnded = true;
+        boolean anyCompleted = false;
+
         for (TaskStatus.WorkerStatus s : workers.values()) {
-            if (s != TaskStatus.WorkerStatus.COMPLETED) return false;
+            if (s != TaskStatus.WorkerStatus.COMPLETED && s != TaskStatus.WorkerStatus.FAILED) {
+                allEnded = false;
+                break; // 只要有一个还在跑，就不是 allEnded
+            }
+            if (s == TaskStatus.WorkerStatus.COMPLETED) {
+                anyCompleted = true;
+            }
         }
-        return true;
+
+        if (allEnded) {
+            if (anyCompleted) {
+                logger.info("All workers ended for task {}. Proceeding to next phase.", taskId);
+                
+                // 如果 Forum 已经完成，则直接生成报告
+                if (status.getForumStatus() == TaskStatus.WorkerStatus.COMPLETED) {
+                    startGeneratingReport(taskId);
+                } else {
+                    // 否则触发 Forum 进行总结
+                    logger.info("Triggering final summary check for Forum on task {}", taskId);
+                    producer.sendMessage("forum", Map.of(
+                            "taskId", taskId,
+                            "type", "FINAL_CHECK",
+                            "engine", "MASTER"
+                    ));
+                    
+                    if (status.getStatus() != TaskStatus.Status.SUMMARIZING) {
+                        taskStatusManager.updateMainStatus(taskId, TaskStatus.Status.SUMMARIZING);
+                    }
+                }
+            } else {
+                // 所有 Worker 都失败了
+                logger.error("All workers failed for task {}. Marking as FAILED.", taskId);
+                taskStatusManager.markTaskFailed(taskId, "All workers failed");
+                taskControlManager.sendCancelCommand(taskId); // 全局取消
+            }
+        } else {
+            logger.info("Task {} still has running workers. Waiting...", taskId);
+        }
     }
 
     private void startGeneratingReport(String taskId) {
