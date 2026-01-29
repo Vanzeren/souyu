@@ -233,8 +233,7 @@ public abstract class AbstractAgent<R> {
             String reflectionSummaryPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY;
             String reflectionSummaryPrompt = new PromptTemplate(reflectionSummaryPromptTemplate)
                     .create(Map.of(
-                            "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"paragraph_latest_state\": \"" + currentSummary + "\"}",
-                            "output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_REFLECTION_SUMMARY
+                            "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"paragraph_latest_state\": \"" + currentSummary + "\"}"
                     ))
                     .getContents();
 
@@ -271,7 +270,13 @@ public abstract class AbstractAgent<R> {
                     getToolNames() // 使用动态工具列表
             );
 
-            return response.getResult().getOutput().getContent();
+            // 记录 Reasoning (思考过程)
+            String reasoning = response.getResult().getOutput().getContent();
+            if (reasoning != null && !reasoning.isBlank()) {
+                logger.info("Reasoning (思考过程):\n{}", reasoning);
+            }
+
+            return reasoning;
         } catch (NonTransientAiException e) {
             logger.error("由于内容安全风险，跳过该段落搜索: {}", e.getMessage());
             return "";
