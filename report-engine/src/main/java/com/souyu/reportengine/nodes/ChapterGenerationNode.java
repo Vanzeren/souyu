@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.client.TimeContextChatClient;
 import com.souyu.reportengine.core.ChapterStorage;
 import com.souyu.reportengine.core.TemplateSection;
+import com.souyu.reportengine.model.ChapterModel;
 import com.souyu.reportengine.prompt.prompts;
 import com.souyu.reportengine.schema.Schema;
 import com.souyu.reportengine.schema.Validator;
@@ -102,34 +103,69 @@ public class ChapterGenerationNode extends BaseNode<ChapterGenerationNode.Input,
             throw new RuntimeException("Failed to serialize LLM payload", e);
         }
 
-        String rawText = streamLlm(userMessage, reportId, section.getChapterId(), streamCallback, chapterMeta, kwargs);
-
         List<String> parseContext = new ArrayList<>();
         boolean placeholderCreated = false;
-        Map<String, Object> chapterJson;
-
-        try {
-            // 使用 JsonParser 进行鲁棒解析
-            chapterJson = jsonParser.parse(rawText, "ChapterJSON", List.of("chapter", "blocks", "chapterId", "title"), "chapter");
-        } catch (Exception parseError) {
-            logger.warn("{} 章节JSON解析失败: {}", section.getTitle(), parseError.getMessage());
-            parseContext.add(parseError.getMessage());
-            archiveFailedOutput(section, rawText);
-            
-            // 尝试跨引擎修复 (暂未实现多引擎，仅占位)
-            Map<String, Object> recovered = null; 
-
-            if (recovered != null) {
-                chapterJson = recovered;
-                logger.info("{} 章节JSON已通过跨引擎修复", section.getTitle());
-            } else {
-                Map.Entry<Map<String, Object>, List<String>> placeholder = buildPlaceholderChapter(section, rawText, parseError);
-                if (placeholder == null) {
-                    throw new RuntimeException(parseError);
+        Map<String, Object> chapterJson = null;
+        
+        // 增加重试机制：如果生成/解析失败，最多重试3次
+        int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                if (attempt > 1) {
+                    logger.info("{} 章节生成重试 第 {}/{} 次", section.getTitle(), attempt, maxRetries);
                 }
-                chapterJson = placeholder.getKey();
-                parseContext.addAll(placeholder.getValue());
-                placeholderCreated = true;
+                
+                String rawText = streamLlm(userMessage, reportId, section.getChapterId(), streamCallback, chapterMeta, kwargs);
+                
+                // 使用 JsonParser 进行鲁棒解析
+                chapterJson = jsonParser.parse(rawText, "ChapterJSON", List.of("chapter", "blocks", "chapterId", "title"), "chapter");
+                
+                // 如果解析成功，跳出循环
+                break;
+                
+            } catch (Exception parseError) {
+                logger.warn("{} 章节JSON解析失败 (尝试 {}/{}): {}", section.getTitle(), attempt, maxRetries, parseError.getMessage());
+                
+                if (attempt == maxRetries) {
+                    // 最后一次尝试失败，生成占位符
+                    parseContext.add(parseError.getMessage());
+                    // 获取最后一次的 rawText (注意：这里需要从 streamLlm 获取，但 streamLlm 返回值在 try 块中)
+                    // 我们可以修改 streamLlm 让它记录最后一次输出，或者在这里无法获取完整的 rawText
+                    // 实际上 archiveFailedOutput 需要 rawText。
+                    // 简单的办法：在 try 块里把 rawText 赋值给外部变量。
+                    // 但 rawText 是局部变量。
+                    // 让我们重构一下循环。
+                }
+            }
+        }
+        
+        // 重构后的重试逻辑
+        String lastRawText = "";
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                if (attempt > 1) {
+                    logger.info("{} 章节生成重试 第 {}/{} 次", section.getTitle(), attempt, maxRetries);
+                }
+                
+                lastRawText = streamLlm(userMessage, reportId, section.getChapterId(), streamCallback, chapterMeta, kwargs);
+                chapterJson = jsonParser.parse(lastRawText, "ChapterJSON", List.of("chapter", "blocks", "chapterId", "title"), "chapter");
+                break; // Success
+                
+            } catch (Exception parseError) {
+                logger.warn("{} 章节JSON解析失败 (尝试 {}/{}): {}", section.getTitle(), attempt, maxRetries, parseError.getMessage());
+                
+                if (attempt == maxRetries) {
+                    parseContext.add(parseError.getMessage());
+                    archiveFailedOutput(section, lastRawText);
+                    
+                    Map.Entry<Map<String, Object>, List<String>> placeholder = buildPlaceholderChapter(section, lastRawText, parseError);
+                    if (placeholder == null) {
+                        throw new RuntimeException(parseError);
+                    }
+                    chapterJson = placeholder.getKey();
+                    parseContext.addAll(placeholder.getValue());
+                    placeholderCreated = true;
+                }
             }
         }
 
@@ -143,7 +179,7 @@ public class ChapterGenerationNode extends BaseNode<ChapterGenerationNode.Input,
 
         Validator.Result validationResult = validator.validateChapter(chapterJson);
         if (!validationResult.isValid() && !validationResult.getErrors().isEmpty()) {
-            Map<String, Object> repaired = attemptLlmStructuralRepair(chapterJson, validationResult.getErrors(), rawText);
+            Map<String, Object> repaired = attemptLlmStructuralRepair(chapterJson, validationResult.getErrors(), lastRawText);
             if (repaired != null) {
                 chapterJson = repaired;
                 chapterJson.putIfAbsent("chapterId", section.getChapterId());
@@ -172,7 +208,18 @@ public class ChapterGenerationNode extends BaseNode<ChapterGenerationNode.Input,
             errorMessages.add(contentError.getMessage());
         }
 
-        storage.saveChapter(reportId, chapterMeta, chapterJson, errorMessages.isEmpty() ? null : errorMessages);
+        // 转换为结构化对象并保存
+        try {
+            ChapterModel.ChapterContent content = objectMapper.convertValue(chapterJson, ChapterModel.ChapterContent.class);
+            storage.saveChapter(reportId, chapterMeta, content, errorMessages.isEmpty() ? null : errorMessages);
+        } catch (IllegalArgumentException e) {
+            logger.error("Failed to convert chapter JSON to structured object", e);
+            // Fallback: save as map if conversion fails? 
+            // But storage.saveChapter now expects ChapterContent.
+            // We should probably throw exception or save a placeholder.
+            // For now, let's throw exception to surface the issue.
+            throw new RuntimeException("Failed to convert chapter JSON to structured object: " + e.getMessage(), e);
+        }
 
         if (!validationResult.isValid()) {
             throw new RuntimeException(section.getTitle() + " 章节JSON校验失败: " + String.join("; ", validationResult.getErrors().subList(0, Math.min(5, validationResult.getErrors().size()))));
@@ -340,7 +387,7 @@ public class ChapterGenerationNode extends BaseNode<ChapterGenerationNode.Input,
         meta.put("rawJsonPreview", (snapshot != null ? snapshot : "").substring(0, Math.min(2000, (snapshot != null ? snapshot : "").length())));
         meta.put("errorMessage", message);
         meta.put("importance", importance);
-        calloutBlock.put("meta", meta);
+        // calloutBlock.put("meta", meta); // REMOVED to prevent crash
 
         Map<String, Object> placeholder = new HashMap<>();
         placeholder.put("chapterId", section.getChapterId());
@@ -349,8 +396,11 @@ public class ChapterGenerationNode extends BaseNode<ChapterGenerationNode.Input,
         placeholder.put("order", section.getOrder());
         placeholder.put("blocks", List.of(headingBlock, calloutBlock));
         placeholder.put("errorPlaceholder", true);
-
-        List<String> errors = List.of(String.format("%s 章节JSON解析失败，已降级为占位。参考 %s#%s", section.getTitle(), logRef.get("relativeFile"), logRef.get("entryId")));
+        
+        // Add meta info to chapter-level errors list instead
+        List<String> errors = new ArrayList<>();
+        errors.add(String.format("%s 章节JSON解析失败，已降级为占位。参考 %s#%s", section.getTitle(), logRef.get("relativeFile"), logRef.get("entryId")));
+        // We can also store the meta map in the chapter's metadata if needed, but errors list is sufficient for now.
 
         return Map.entry(placeholder, errors);
     }

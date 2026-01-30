@@ -1,5 +1,6 @@
 package com.souyu.reportengine.core;
 
+import com.souyu.reportengine.model.ChapterModel;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.slf4j.Logger;
@@ -92,10 +93,10 @@ public class ChapterStorage {
      *
      * @param reportId    报告ID。
      * @param chapterMeta 章节元信息。
-     * @param payload     校验通过的章节JSON。
+     * @param payload     校验通过的章节JSON (结构化对象)。
      * @param errors      错误列表。
      */
-    public void saveChapter(String reportId, Map<String, Object> chapterMeta, Map<String, Object> payload, List<String> errors) {
+    public void saveChapter(String reportId, Map<String, Object> chapterMeta, ChapterModel.ChapterContent payload, List<String> errors) {
         String chapterId = (String) chapterMeta.get("chapterId");
         String status = (errors == null || errors.isEmpty()) ? "ready" : "invalid";
 
@@ -117,12 +118,12 @@ public class ChapterStorage {
     /**
      * 加载指定报告的所有章节 Payload。
      */
-    public List<Map<String, Object>> getChapters(String reportId) {
+    public List<ChapterModel.ChapterContent> getChapters(String reportId) {
         Query query = new Query(Criteria.where("reportId").is(reportId));
         query.with(Sort.by(Sort.Direction.ASC, "order"));
         
         List<Chapter> chapters = mongoTemplate.find(query, Chapter.class);
-        List<Map<String, Object>> payloads = new ArrayList<>();
+        List<ChapterModel.ChapterContent> payloads = new ArrayList<>();
         
         for (Chapter chapter : chapters) {
             if (chapter.getPayload() != null) {
@@ -181,7 +182,7 @@ public class ChapterStorage {
         private String status;
         private String updatedAt;
         private String rawContent;
-        private Map<String, Object> payload;
+        private ChapterModel.ChapterContent payload;
         private List<String> errors;
     }
 

@@ -218,7 +218,9 @@ public final class DeepSearchPrompts {
            
              2. **制定高精度的搜索策略：**
                  * 设计针对性强的搜索词，涵盖：新闻门户（权威性）、社交媒体（实时情绪）、行业分析/评论（深度见解）。
-                 * **[技术约束]**：若使用 `search_news_by_date` 工具，**必须**严格遵守 `YYYY-MM-DD` 格式提供 `start_date` 和 `end_date`（例如：2026-01-20）。
+                 * 使用合适的工具进行搜索，你可以使用的工具以及通过toolsName告诉你了，也有description
+                 * **[技术约束]**：若使用 `searchNewsByDate` 工具，**必须**严格遵守 `YYYY-MM-DD` 格式提供 `start_date` 和 `end_date`（例如：2026-01-20）。
+                 注意：除了search_news_by_date工具外，其他工具都不需要额外参数。
            
            
              3. **多源验证与“脱水”处理：**
@@ -270,6 +272,7 @@ public final class DeepSearchPrompts {
             3. 如果选择search_news_by_date工具，必须同时提供start_date和end_date参数（格式：YYYY-MM-DD）
             4. 解释你的选择理由
             5. 仔细核查新闻中的可疑点，破除谣言和误导，尽力还原事件原貌
+            6. 由于你的输出将会用于增强总结的prompt,所以请总结时标注信息的来源或参考链接，拥有客观的数据支撑，保证信息尽量客观
 
             注意：除了search_news_by_date工具外，其他工具都不需要额外参数。
             请直接调用工具，不需要输出 JSON 格式的计划。
@@ -338,7 +341,7 @@ public final class DeepSearchPrompts {
                - 信息量大，避免冗余和套话
                - 既要专业又要易懂
 
-            确保输出是一个符合上述输出的内容，严格按照结构化内容组织，不需要解释或额外文本
+            请务必将生成的 Markdown 内容作为 JSON 字段 "paragraph_latest_state" 的值。输出必须是严格的 JSON 格式。
             """;
 
     public static final String SYSTEM_PROMPT_REFLECTION = """
@@ -357,6 +360,7 @@ public final class DeepSearchPrompts {
             4. 如果选择search_news_by_date工具，必须同时提供start_date和end_date参数（格式：YYYY-MM-DD）
             5. 解释你的选择和推理
             6. 仔细核查新闻中的可疑点，破除谣言和误导，尽力还原事件原貌
+            7. 由于你的输出将会用于增强总结的prompt,所以请总结时标注信息的来源或参考链接，拥有客观的数据支撑，保证信息尽量客观
 
             注意：除了search_news_by_date工具外，其他工具都不需要额外参数。
             请直接调用工具，不需要输出 JSON 格式的计划。
@@ -377,7 +381,7 @@ public final class DeepSearchPrompts {
             适当地组织段落结构以便纳入报告中。
             请按照以下JSON模式定义格式化输出：
            
-            确保输出是一个符合上述输出的内容，严格按照结构化内容组织，不需要额外解释或额外文本
+            请务必将更新后的 Markdown 内容作为 JSON 字段 "updated_paragraph_latest_state" 的值。输出必须是严格的 JSON 格式。
             """;
 
     public static final String SYSTEM_PROMPT_REPORT_FORMATTING = """

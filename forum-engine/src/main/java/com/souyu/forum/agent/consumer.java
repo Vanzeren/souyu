@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class consumer implements InitializingBean, DisposableBean {
@@ -123,13 +124,24 @@ public class consumer implements InitializingBean, DisposableBean {
                 if (messages != null && !messages.isEmpty()) {
                     for (MapRecord<String, Object, Object> message : messages) {
                         RLock lock = redissonClient.getLock(LOCK_PREFIX + message.getId());
-                        handleMessage(message);
-                        // 确认消息
-                        if (lock.isHeldByCurrentThread()){
-                            lock.unlock();
+                        boolean isLocked = false;
+                        try {
+                            // 尝试获取锁，等待 100ms，持有 30s
+                            isLocked = lock.tryLock(100, 30000, TimeUnit.MILLISECONDS);
+                            if (isLocked) {
+                                handleMessage(message);
+                                redisTemplate.opsForStream().acknowledge(streamKey, groupName, message.getId());
+                            } else {
+                                logger.warn("Could not acquire lock for message {}, skipping.", message.getId());
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            logger.error("Interrupted while waiting for lock", e);
+                        } finally {
+                            if (isLocked && lock.isHeldByCurrentThread()) {
+                                lock.unlock();
+                            }
                         }
-                        redisTemplate.opsForStream().acknowledge(streamKey, groupName, message.getId());
-
                     }
                 }
             } catch (Exception e) {
@@ -174,35 +186,39 @@ public class consumer implements InitializingBean, DisposableBean {
 
             // 加任务锁，防止与 handlePreFinishedMessage 冲突
             RLock taskLock = redissonClient.getLock("souyu:forum:tasklock:" + taskId);
-            taskLock.lock();
-            try {
-                OneLog log = new OneLog();
-                log.setEngine(engine);
-                log.setContent(content);
-                log.setTimeStamp(System.currentTimeMillis());
+            // 尝试获取任务锁，避免死锁
+            if (taskLock.tryLock(5, 60, TimeUnit.SECONDS)) {
+                try {
+                    OneLog log = new OneLog();
+                    log.setEngine(engine);
+                    log.setContent(content);
+                    log.setTimeStamp(System.currentTimeMillis());
 
-                // 使用 MongoDB 的 upsert + $push
-                Query query = new Query(Criteria.where("_id").is(taskId));
-                Update update = new Update().push("content", log);
+                    // 使用 MongoDB 的 upsert + $push
+                    Query query = new Query(Criteria.where("_id").is(taskId));
+                    Update update = new Update().push("content", log);
 
-                mongoTemplate.upsert(query, update, ForumLog.class, "forum_logs");
+                    mongoTemplate.upsert(query, update, ForumLog.class, "forum_logs");
 
-                logger.info("Appended log to MongoDB for task: {}", taskId);
+                    logger.info("Appended log to MongoDB for task: {}", taskId);
 
-                // 2. 执行 Lua 脚本
-                // 只传递计数器 Key，不传递内容
-                Long result = redisTemplate.execute(
-                        logSummaryScript,
-                        Arrays.asList("log:counter:" + taskId), // KEYS
-                        "5", "86400" // ARGV: 阈值, 过期时间
-                );
+                    // 2. 执行 Lua 脚本
+                    // 只传递计数器 Key，不传递内容
+                    Long result = redisTemplate.execute(
+                            logSummaryScript,
+                            Arrays.asList("log:counter:" + taskId), // KEYS
+                            "5", "86400" // ARGV: 阈值, 过期时间
+                    );
 
-                // 3. 如果返回 1，说明达到阈值
-                if (result != null && result == 1) {
-                    performSummary(taskId, false); // 阶段性总结，不标记为 COMPLETED
+                    // 3. 如果返回 1，说明达到阈值
+                    if (result != null && result == 1) {
+                        performSummary(taskId, false); // 阶段性总结，不标记为 COMPLETED
+                    }
+                } finally {
+                    taskLock.unlock();
                 }
-            } finally {
-                taskLock.unlock();
+            } else {
+                logger.warn("Could not acquire task lock for task {}, skipping message processing.", taskId);
             }
 
         } catch (Exception e) {
@@ -215,19 +231,27 @@ public class consumer implements InitializingBean, DisposableBean {
      */
     private void performFinalCheck(String taskId) {
         RLock taskLock = redissonClient.getLock("souyu:forum:tasklock:" + taskId);
-        taskLock.lock();
         try {
-            if (!checkLastIsHost(taskId)) {
-                logger.info("Final check: Last log is NOT HOST, performing summary for task: {}", taskId);
-                performSummary(taskId, true); // 最终总结，标记为 COMPLETED
+            if (taskLock.tryLock(5, 60, TimeUnit.SECONDS)) {
+                try {
+                    if (!checkLastIsHost(taskId)) {
+                        logger.info("Final check: Last log is NOT HOST, performing summary for task: {}", taskId);
+                        performSummary(taskId, true); // 最终总结，标记为 COMPLETED
+                    } else {
+                        logger.info("Final check: Last log is already HOST, marking as COMPLETED for task: {}", taskId);
+                        // 即使已经是 HOST，也要确保状态是 COMPLETED 并发送事件，以防万一
+                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+                        producer.triggerForumCompleted(taskId); // 使用新方法
+                    }
+                } finally {
+                    taskLock.unlock();
+                }
             } else {
-                logger.info("Final check: Last log is already HOST, marking as COMPLETED for task: {}", taskId);
-                // 即使已经是 HOST，也要确保状态是 COMPLETED 并发送事件，以防万一
-                taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                producer.triggerForumCompleted(taskId); // 使用新方法
+                 logger.warn("Could not acquire task lock for final check on task {}", taskId);
             }
-        } finally {
-            taskLock.unlock();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.error("Interrupted while waiting for task lock", e);
         }
     }
     

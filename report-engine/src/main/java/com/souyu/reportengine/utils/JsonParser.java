@@ -281,8 +281,213 @@ public class JsonParser {
             logger.warn("检测到数组误用为对象（[]包含键值对），已自动转换为对象{}");
             mutated = true;
         }
+        
+        // 新增：修复对象误用为数组的情况
+        Map.Entry<String, Boolean> objectAsArrayResult = fixObjectAsArray(repaired);
+        if (objectAsArrayResult.getValue()) {
+            repaired = objectAsArrayResult.getKey();
+            logger.warn("检测到对象误用为数组（{{}}），已自动转换为数组[]");
+            mutated = true;
+        }
+        
+        // 新增：修复未引号的关键字 (function, undefined)
+        Map.Entry<String, Boolean> unquotedKeywordsResult = fixUnquotedKeywords(repaired);
+        if (unquotedKeywordsResult.getValue()) {
+            repaired = unquotedKeywordsResult.getKey();
+            logger.warn("检测到未引号的关键字(function/undefined)，已自动添加引号");
+            mutated = true;
+        }
+        
+        // 新增：修复对象中误用数组的情况
+        Map.Entry<String, Boolean> arrayInObjectResult = fixArrayInObject(repaired);
+        if (arrayInObjectResult.getValue()) {
+            repaired = arrayInObjectResult.getKey();
+            logger.warn("检测到对象中误用数组（{[...]}），已自动转换为数组[]");
+            mutated = true;
+        }
+        
+        // 新增：修复截断的 JSON
+        Map.Entry<String, Boolean> truncatedResult = fixTruncatedJson(repaired);
+        if (truncatedResult.getValue()) {
+            repaired = truncatedResult.getKey();
+            logger.warn("检测到 JSON 截断，已自动补全闭合符号");
+            mutated = true;
+        }
+        
+        // 新增：修复数组提前闭合的情况 (} ] , {)
+        Map.Entry<String, Boolean> prematureArrayResult = fixPrematureArrayClosure(repaired);
+        if (prematureArrayResult.getValue()) {
+            repaired = prematureArrayResult.getKey();
+            logger.warn("检测到数组提前闭合（} ] , {），已自动修复为（} , {）");
+            mutated = true;
+        }
+        
+        // 新增：修复二维数组提前闭合的情况 (] ] , [ [)
+        Map.Entry<String, Boolean> prematureListResult = fixPrematureListClosure(repaired);
+        if (prematureListResult.getValue()) {
+            repaired = prematureListResult.getKey();
+            logger.warn("检测到二维数组提前闭合（] ] , [ [），已自动修复为（] , [）");
+            mutated = true;
+        }
 
         return mutated ? repaired : text;
+    }
+    
+    private Map.Entry<String, Boolean> fixPrematureListClosure(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        // 针对二维数组提前闭合： [[...]] , [[...]]
+        // 替换为： [[...], [...]]
+        // 正则： \] \s* \] \s* , \s* \[ \s* \[
+        
+        String repaired = text.replaceAll("\\]\\s*\\]\\s*,\\s*\\[\\s*\\[", "], [");
+        
+        return Map.entry(repaired, !repaired.equals(text));
+    }
+    
+    private Map.Entry<String, Boolean> fixPrematureArrayClosure(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        // 针对 LLM 错误模式： { ... } ], { ... }
+        // 替换为： { ... } , { ... }
+        // 正则： \} \s* \] \s* , \s* \{
+        
+        String repaired = text.replaceAll("\\}\\s*\\]\\s*,\\s*\\{", "}, {");
+        
+        return Map.entry(repaired, !repaired.equals(text));
+    }
+    
+    private Map.Entry<String, Boolean> fixTruncatedJson(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        StringBuilder repaired = new StringBuilder(text);
+        boolean inString = false;
+        boolean escaped = false;
+        Deque<Character> stack = new ArrayDeque<>();
+        
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            
+            if (ch == '"') {
+                inString = !inString;
+                continue;
+            }
+            
+            if (!inString) {
+                if (ch == '{' || ch == '[') {
+                    stack.push(ch);
+                } else if (ch == '}' || ch == ']') {
+                    if (!stack.isEmpty()) {
+                        char opener = stack.peek();
+                        if ((ch == '}' && opener == '{') || (ch == ']' && opener == '[')) {
+                            stack.pop();
+                        }
+                    }
+                }
+            }
+        }
+        
+        boolean mutated = false;
+        
+        // 1. 补全未闭合的字符串
+        if (inString) {
+            repaired.append('"');
+            mutated = true;
+        }
+        
+        // 2. 补全未闭合的括号
+        while (!stack.isEmpty()) {
+            char opener = stack.pop();
+            if (opener == '{') {
+                repaired.append('}');
+            } else if (opener == '[') {
+                repaired.append(']');
+            }
+            mutated = true;
+        }
+        
+        return Map.entry(repaired.toString(), mutated);
+    }
+    
+    private Map.Entry<String, Boolean> fixArrayInObject(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        String trimmed = text.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            // 检查内部是否紧跟着一个 [
+            int firstBracket = trimmed.indexOf('[', 1);
+            if (firstBracket != -1) {
+                // 检查这两个符号之间是否只有空白
+                String between = trimmed.substring(1, firstBracket);
+                if (between.trim().isEmpty()) {
+                    // 确实是 { [ ... ] } 模式
+                    // 检查结尾是否是 ] }
+                    int lastBracket = trimmed.lastIndexOf(']');
+                    if (lastBracket != -1) {
+                        // 提取 [ ... ] 部分
+                        String repaired = trimmed.substring(firstBracket, lastBracket + 1);
+                        return Map.entry(repaired, true);
+                    }
+                }
+            }
+        }
+        return Map.entry(text, false);
+    }
+    
+    private Map.Entry<String, Boolean> fixUnquotedKeywords(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        String repaired = text;
+        boolean mutated = false;
+        
+        // 修复未引号的 function: : function -> : "function"
+        Pattern pFunction = Pattern.compile(":(\\s*)function");
+        Matcher mFunction = pFunction.matcher(repaired);
+        if (mFunction.find()) {
+            repaired = mFunction.replaceAll(":$1\"function\"");
+            mutated = true;
+        }
+        
+        // 修复 undefined: : undefined -> : "undefined"
+        Pattern pUndefined = Pattern.compile(":(\\s*)undefined");
+        Matcher mUndefined = pUndefined.matcher(repaired);
+        if (mUndefined.find()) {
+            repaired = mUndefined.replaceAll(":$1\"undefined\"");
+            mutated = true;
+        }
+        
+        return Map.entry(repaired, mutated);
+    }
+    
+    private Map.Entry<String, Boolean> fixObjectAsArray(String text) {
+        if (text == null) return Map.entry(text, false);
+        
+        String trimmed = text.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            // 检查内部是否紧跟着一个 {
+            int firstBrace = trimmed.indexOf('{', 1);
+            if (firstBrace != -1) {
+                // 检查这两个 { 之间是否只有空白
+                String between = trimmed.substring(1, firstBrace);
+                if (between.trim().isEmpty()) {
+                    // 确实是 { { ... } } 模式
+                    // 将外层的 {} 替换为 []
+                    String repaired = "[" + trimmed.substring(1, trimmed.length() - 1) + "]";
+                    return Map.entry(repaired, true);
+                }
+            }
+        }
+        return Map.entry(text, false);
     }
     
     private Map.Entry<String, Boolean> fixArrayAsObject(String text) {

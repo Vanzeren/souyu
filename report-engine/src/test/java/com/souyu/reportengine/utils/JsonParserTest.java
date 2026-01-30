@@ -137,4 +137,24 @@ class JsonParserTest {
         String jsonStr = "{完全不是JSON格式的内容###";
         assertThrows(JsonParser.JsonParseError.class, () -> parser.parse(jsonStr, "无法修复测试", null, null));
     }
+
+    @Test
+    void testPrematureNestedListClosure() {
+        // Case 1: Triple brackets ]]] , [[
+        // 模拟 LLM 输出: items: [ [item1] ] ] , [ [item2] ]
+        String jsonStr1 = "{\"items\": [[{\"t\":1}]]], [[{\"t\":2}]]}";
+        
+        Map<String, Object> result1 = parser.parse(jsonStr1, "三重闭合测试", null, null);
+        List<?> items1 = (List<?>) result1.get("items");
+        assertEquals(2, items1.size());
+        
+        // Case 2: Double brackets ]] , [[
+        // 模拟 LLM 输出: items: [ [item1] ], [ [item2] ]
+        // 注意：这里 items 数组被提前闭合了
+        String jsonStr2 = "{\"items\": [[{\"t\":1}]], [[{\"t\":2}]]}";
+        
+        Map<String, Object> result2 = parser.parse(jsonStr2, "双重闭合测试", null, null);
+        List<?> items2 = (List<?>) result2.get("items");
+        assertEquals(2, items2.size());
+    }
 }

@@ -481,8 +481,13 @@ public class prompts {
             %s
             </CHAPTER JSON SCHEMA>
 
-            输出格式：
-            {"chapter": {...遵循上述Schema的章节JSON...}}
+            **输出格式：**
+            请直接输出 JSON 对象，格式如下：
+            {
+              "chapter": {
+                ... (符合 Schema 的内容)
+              }
+            }
 
             严禁添加除JSON以外的任何文本或注释。
             """.formatted(Schema.IR_VERSION, String.join(", ", Schema.ALLOWED_BLOCK_TYPES), Schema.CHAPTER_JSON_SCHEMA_TEXT);
