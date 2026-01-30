@@ -3,6 +3,9 @@ package com.souyu.common.agent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.config.AgentConfig;
 import com.souyu.common.context.SearchContext;
+import com.souyu.common.dto.SourceItem;
+import com.souyu.common.dto.SummaryResult;
+import com.souyu.common.dto.UpdatedSummaryResult;
 import com.souyu.common.manager.StateManager;
 import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
@@ -17,26 +20,27 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.PromptTemplate;
+import org.springframework.ai.converter.BeanOutputConverter;
 import org.springframework.ai.retry.NonTransientAiException;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.Async;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 public abstract class AbstractAgent<R> {
 
     private static final Logger logger = LoggerFactory.getLogger(AbstractAgent.class);
 
     @Autowired
-    private TimeContextChatClient chatClient; // 使用 TimeContextChatClient
+    private TimeContextChatClient chatClient;
 
     @Autowired
     private ReportStructureNode reportStructureNode;
@@ -44,10 +48,8 @@ public abstract class AbstractAgent<R> {
     @Autowired
     private QueryFormattingNode queryFormattingNode;
 
-
     protected abstract AgentConfig getAgentConfig();
 
-    // 保留 getToolNames()，用于动态注册工具
     protected abstract String[] getToolNames();
 
     @Autowired
@@ -66,9 +68,6 @@ public abstract class AbstractAgent<R> {
 
     @Async("taskExecutor")
     public void research(String query, boolean saveReport, String taskId) {
-        // 显式初始化 State，确保 taskId 和 query 被正确记录
-        // stateManager.initState(taskId, query); // 移除显式初始化，避免覆盖
-
         logger.info("============================================================");
         logger.info("开始深度研究: {}", query);
         logger.info("============================================================");
@@ -140,15 +139,11 @@ public abstract class AbstractAgent<R> {
 
     public void generateReportStructure(State state, String query) {
         logger.info("正在生成报告结构...");
-
         Map<String, Object> kwargs = new HashMap<>();
-        // 如果需要支持自定义 Prompt，可以在这里处理，但目前统一使用 DeepSearchPrompts
-
         state = reportStructureNode.mutateState(query, state, kwargs);
 
         StringBuilder message = new StringBuilder();
         message.append("报告结构已生成，共 ").append(state.getParagraphs().size()).append(" 个段落:");
-
         int i = 1;
         for (Paragraph paragraph : state.getParagraphs()) {
             message.append("\n  ").append(i++).append(". ").append(paragraph.getTitle());
@@ -166,88 +161,79 @@ public abstract class AbstractAgent<R> {
 
         logger.info("开始处理段落 {}: {}", paragraphIndex + 1, paragraphSnapshot.getTitle());
 
+        // 准备基础输入数据
+        Map<String, String> baseInputMap = new HashMap<>();
+        baseInputMap.put("title", paragraphSnapshot.getTitle());
+        baseInputMap.put("content", paragraphSnapshot.getContent());
+
         // 1. 首次搜索 (Function Calling)
-        // 使用 DeepSearchPrompts
-        String firstSearchPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_FIRST_SEARCH;
-        String firstSearchPrompt = new PromptTemplate(firstSearchPromptTemplate)
+        String firstSearchPrompt = new PromptTemplate(DeepSearchPrompts.SYSTEM_PROMPT_FIRST_SEARCH)
                 .create(Map.of(
-                        "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"content\": \"" + paragraphSnapshot.getContent() + "\"}",
-                        // 移除 tool_description
+                        "input_schema", toJson(baseInputMap),
                         "current_date", LocalDate.now().toString()
                 ))
                 .getContents();
 
-        // Step 1: 调用工具获取信息
         String searchResult = performSearch(taskId, paragraphSnapshot, firstSearchPrompt);
-
-        // 捕获并保存结构化搜索结果
         captureSearchResults(taskId, paragraphIndex, "First Search");
 
         // 2. 首次总结 (Text Generation)
-        String firstSummaryPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_FIRST_SUMMARY;
-        String firstSummaryPrompt = new PromptTemplate(firstSummaryPromptTemplate)
-                .create(Map.of(
-                        "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"content\": \"" + paragraphSnapshot.getContent() + "\"}",
-                        "output_schema", DeepSearchPrompts.OUTPUT_SCHEMA_FIRST_SUMMARY
-                ))
-                .getContents();
+        String firstSummaryContent = generateContent(
+                DeepSearchPrompts.SYSTEM_PROMPT_FIRST_SUMMARY,
+                baseInputMap,
+                searchResult,
+                SummaryResult.class,
+                SummaryResult::paragraph_latest_state
+        );
 
-        // 将搜索结果附带在 Prompt 中
-        String finalSummaryPrompt = firstSummaryPrompt + "\n\n以下是搜索结果：\n" + searchResult;
-
-        // 调用 LLM 生成总结 (不带工具)
-        String firstSummaryJson = chatClient.call(new org.springframework.ai.chat.prompt.Prompt(finalSummaryPrompt)).getResult().getOutput().getContent();
-
-        // 解析 JSON 获取 content
-        String firstSummaryContent = extractContentFromJson(firstSummaryJson);
-        // 添加日志输出
         logger.info("段落 {} 首次总结:\n{}", paragraphIndex + 1, firstSummaryContent);
-
-        stateManager.executeUpdate(taskId, s -> s.getParagraph(paragraphIndex).getResearch().setLatestSummary(firstSummaryContent));
-        producer.sendMessage("forum", Map.of("taskId", taskId, "content", firstSummaryContent, "engine", engineName()));
+        updateParagraphSummary(taskId, paragraphIndex, firstSummaryContent);
+        
+        // 修复 NPE: 确保 content 不为 null
+        String safeFirstSummaryContent = firstSummaryContent != null ? firstSummaryContent : "";
+        producer.sendMessage("forum", Map.of("taskId", taskId, "content", safeFirstSummaryContent, "engine", engineName()));
 
         // 3. 反思循环
-        String currentSummary = firstSummaryContent;
-        for (int i = 0; i < getAgentConfig().getSearch().getMaxReflections(); i++) {
-            checkIfCancelled(taskId);
-            logger.info("  - 反思 {}/{}", i + 1, getAgentConfig().getSearch().getMaxReflections());
+        String currentSummary = safeFirstSummaryContent;
+        int maxReflections = getAgentConfig().getSearch().getMaxReflections();
 
-            String reflectionPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION;
-            String reflectionPrompt = new PromptTemplate(reflectionPromptTemplate)
+        for (int i = 0; i < maxReflections; i++) {
+            checkIfCancelled(taskId);
+            logger.info("  - 反思 {}/{}", i + 1, maxReflections);
+
+            Map<String, String> reflectionInputMap = new HashMap<>();
+            reflectionInputMap.put("title", paragraphSnapshot.getTitle());
+            reflectionInputMap.put("paragraph_latest_state", currentSummary);
+
+            // Reflection Search
+            String reflectionPrompt = new PromptTemplate(DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION)
                     .create(Map.of(
-                            "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"paragraph_latest_state\": \"" + currentSummary + "\"}",
-                            // 移除 tool_description
+                            "input_schema", toJson(reflectionInputMap),
                             "current_date", LocalDate.now().toString()
                     ))
                     .getContents();
 
-            // Step 1: 调用工具获取补充信息
             String reflectionSearchResult = performSearch(taskId, paragraphSnapshot, reflectionPrompt);
-
-            // 捕获并保存结构化搜索结果
             captureSearchResults(taskId, paragraphIndex, "Reflection Search " + (i + 1));
 
-            // Step 2: 使用专门的 Prompt 生成更新后的总结
-            String reflectionSummaryPromptTemplate = DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY;
-            String reflectionSummaryPrompt = new PromptTemplate(reflectionSummaryPromptTemplate)
-                    .create(Map.of(
-                            "input_schema", "{\"title\": \"" + paragraphSnapshot.getTitle() + "\", \"paragraph_latest_state\": \"" + currentSummary + "\"}"
-                    ))
-                    .getContents();
+            // Reflection Summary
+            String updatedSummaryContent = generateContent(
+                    DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
+                    reflectionInputMap,
+                    reflectionSearchResult,
+                    UpdatedSummaryResult.class,
+                    UpdatedSummaryResult::updated_paragraph_latest_state
+            );
 
-            String finalReflectionSummaryPrompt = reflectionSummaryPrompt + "\n\n以下是补充搜索结果：\n" + reflectionSearchResult;
-
-            String updatedSummaryJson = chatClient.call(new org.springframework.ai.chat.prompt.Prompt(finalReflectionSummaryPrompt)).getResult().getOutput().getContent();
-            String updatedSummaryContent = extractContentFromJson(updatedSummaryJson);
-
-            // 添加日志输出
             logger.info("段落 {} 反思 {} 更新总结:\n{}", paragraphIndex + 1, i + 1, updatedSummaryContent);
 
-            currentSummary = updatedSummaryContent;
-            stateManager.executeUpdate(taskId, s -> s.getParagraph(paragraphIndex).getResearch().setLatestSummary(updatedSummaryContent));
+            // 修复 NPE: 确保 content 不为 null
+            String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
+            currentSummary = safeUpdatedSummaryContent;
+            updateParagraphSummary(taskId, paragraphIndex, currentSummary);
 
-            if (i == getAgentConfig().getSearch().getMaxReflections() - 1) {
-                producer.sendMessage("forum", Map.of("taskId", taskId, "content", updatedSummaryContent, "engine", engineName()));
+            if (i == maxReflections - 1) {
+                producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
             }
         }
 
@@ -255,25 +241,68 @@ public abstract class AbstractAgent<R> {
         logger.info("段落 {} 处理完成", paragraphIndex + 1);
     }
 
-    // 重命名为 performSearch，只负责搜索
-    private String performSearch(String taskId, Paragraph paragraph, String userPrompt) {
-        // 清理上下文，防止污染
-        SearchContext.clear();
+    // 通用内容生成方法 (使用 BeanOutputConverter)
+    private <T> String generateContent(String promptTemplateStr, Map<String, String> inputMap, String searchResult, Class<T> dtoClass, Function<T, String> contentExtractor) {
+        BeanOutputConverter<T> converter = new BeanOutputConverter<>(dtoClass);
+
+        String prompt = new PromptTemplate(promptTemplateStr)
+                .create(Map.of(
+                        "input_schema", toJson(inputMap),
+                        "output_schema", converter.getFormat()
+                ))
+                .getContents();
+
+        String finalPrompt = prompt + "\n\n以下是搜索结果：\n" + searchResult;
+        
+        String jsonResponse = null;
+        try {
+            jsonResponse = chatClient.call(new org.springframework.ai.chat.prompt.Prompt(finalPrompt)).getResult().getOutput().getContent();
+        } catch (Exception e) {
+            logger.error("LLM call failed", e);
+            return ""; // LLM 调用失败，返回空字符串
+        }
+
+        if (jsonResponse == null) {
+            return "";
+        }
 
         try {
-            // 使用 TimeContextChatClient 的 callWithFunctions 方法
-            // 这样可以复用时间注入逻辑，并且支持 Function Calling
+            T result = converter.convert(jsonResponse);
+            return contentExtractor.apply(result);
+        } catch (Exception e) {
+            logger.warn("BeanOutputConverter failed, falling back to manual extraction: {}", e.getMessage());
+            // Fallback: 如果解析失败，尝试手动提取，或者直接返回原始文本（如果它看起来像 Markdown）
+            String extracted = extractContentFromJson(jsonResponse);
+            return extracted != null ? extracted : "";
+        }
+    }
+
+    private void updateParagraphSummary(String taskId, Integer paragraphIndex, String summary) {
+        // 确保 summary 不为 null
+        String safeSummary = summary != null ? summary : "";
+        stateManager.executeUpdate(taskId, s -> s.getParagraph(paragraphIndex).getResearch().setLatestSummary(safeSummary));
+    }
+
+    private String toJson(Object object) {
+        try {
+            return objectMapper.writeValueAsString(object);
+        } catch (Exception e) {
+            logger.error("JSON serialization failed", e);
+            return "{}";
+        }
+    }
+
+    private String performSearch(String taskId, Paragraph paragraph, String userPrompt) {
+        SearchContext.clear();
+        try {
             ChatResponse chatResponse = chatClient.callWithFunctions(
                     new org.springframework.ai.chat.prompt.Prompt(userPrompt),
-                    getToolNames() // 使用动态工具列表
+                    getToolNames()
             );
-
-            // 记录 Reasoning (思考过程)
             String reasoning = chatResponse.getResult().getOutput().getContent();
             if (reasoning != null && !reasoning.isBlank()) {
                 logger.info("Reasoning (思考过程):\n{}", reasoning);
             }
-
             return reasoning;
         } catch (NonTransientAiException e) {
             logger.error("由于内容安全风险，跳过该段落搜索: {}", e.getMessage());
@@ -281,28 +310,35 @@ public abstract class AbstractAgent<R> {
         }
     }
 
-    // 捕获并保存结构化搜索结果
     private void captureSearchResults(String taskId, Integer paragraphIndex, String queryDescription) {
-        // 从 SearchContext 获取原始 Response
         R rawResponse = (R) SearchContext.getLastResponse();
         if (rawResponse != null) {
-            // 提取结构化数据
-            List<Map<String, Object>> results = extractSearchResults(rawResponse);
+            List<SourceItem> results = extractSearchResults(rawResponse);
             if (results != null && !results.isEmpty()) {
+                List<Map<String, Object>> resultsMap = results.stream().map(item -> {
+                    Map<String, Object> map = new HashMap<>();
+                    map.put("title", item.title());
+                    map.put("url", item.url());
+                    map.put("content", item.content());
+                    map.put("score", item.score());
+                    map.put("published_date", item.publishedDate());
+                    map.put("source", item.source());
+                    return map;
+                }).collect(Collectors.toList());
+
                 stateManager.executeUpdate(taskId, s -> {
-                    s.getParagraph(paragraphIndex).getResearch().addSearchResults(queryDescription, results);
+                    s.getParagraph(paragraphIndex).getResearch().addSearchResults(queryDescription, resultsMap);
                 });
                 logger.info("Captured {} structured search results for paragraph {}", results.size(), paragraphIndex + 1);
             }
         } else {
             logger.warn("No structured search results captured for paragraph {}", paragraphIndex + 1);
         }
-        // 清理上下文
         SearchContext.clear();
     }
 
-    // 简单的 JSON 提取辅助方法 (假设 LLM 返回的是 {"paragraph_latest_state": "..."} 或 {"updated_paragraph_latest_state": "..."})
     private String extractContentFromJson(String json) {
+        if (json == null) return "";
         try {
             Map<String, Object> map = objectMapper.readValue(json, Map.class);
             if (map.containsKey("paragraph_latest_state")) {
@@ -310,18 +346,15 @@ public abstract class AbstractAgent<R> {
             } else if (map.containsKey("updated_paragraph_latest_state")) {
                 return (String) map.get("updated_paragraph_latest_state");
             }
-            // 如果不是 JSON 或没有特定字段，直接返回原始文本
             return json;
         } catch (Exception e) {
-            // 解析失败，说明 LLM 可能直接返回了文本，或者 JSON 格式有误
-            // 为了鲁棒性，直接返回原始文本
+            // 如果不是 JSON，直接返回原始文本（假设它是 Markdown）
             return json;
         }
     }
 
     public String generateFinalReport(State state) {
         logger.info("\n[步骤 3] 生成最终报告...");
-
         List<Map<String, String>> reportData = new ArrayList<>();
         for (Paragraph paragraph : state.getParagraphs()) {
             Map<String, String> map = new HashMap<>();
@@ -347,7 +380,6 @@ public abstract class AbstractAgent<R> {
 
         state.setFinalReport(finalReport);
         state.markCompleted();
-
         logger.info("最终报告生成完成");
         return finalReport;
     }
@@ -358,9 +390,7 @@ public abstract class AbstractAgent<R> {
         if (querySafe.length() > 30) {
             querySafe = querySafe.substring(0, 30);
         }
-
         String filename = String.format("deep_search_report_%s_%s.md", querySafe, timestamp);
-
         try {
             stateManager.saveContentToMinio(reportContent, filename, engine, taskId);
             logger.info("报告已保存到 MinIO: {}", filename);
@@ -369,7 +399,6 @@ public abstract class AbstractAgent<R> {
         }
     }
 
-    // 辅助方法：获取进度摘要 (如果需要)
     public Map<String, Object> getProgressSummary(String taskId) {
         State state = stateManager.getState(taskId);
         if (state != null) {
@@ -378,9 +407,7 @@ public abstract class AbstractAgent<R> {
         return new HashMap<>();
     }
 
-    // 辅助方法：提取搜索结果 (如果需要)
-    protected abstract List<Map<String, Object>> extractSearchResults(R response);
+    protected abstract List<SourceItem> extractSearchResults(R response);
 
-    // 辅助方法：执行搜索工具 (如果需要，虽然现在主要靠 Function Calling)
     public abstract R executeSearchTool(String toolName, String query, Map<String, Object> kwargs);
 }

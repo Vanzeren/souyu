@@ -3,6 +3,7 @@ package com.souyu.queryengine.agent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.agent.AbstractAgent;
 import com.souyu.common.config.AgentConfig;
+import com.souyu.common.dto.SourceItem;
 import com.souyu.common.tavily.TavilyClient;
 import com.souyu.common.tavily.model.SearchResult;
 import com.souyu.common.tavily.model.TavilyResponse;
@@ -77,22 +78,22 @@ public class QueryAgent extends AbstractAgent<TavilyResponse> {
     }
 
     @Override
-    protected List<Map<String, Object>> extractSearchResults(TavilyResponse response) {
+    protected List<SourceItem> extractSearchResults(TavilyResponse response) {
         if (response == null || response.getResults() == null) {
             return new ArrayList<>();
         }
 
-        List<Map<String, Object>> resultsMap = new ArrayList<>();
+        List<SourceItem> items = new ArrayList<>();
         for (SearchResult result : response.getResults()) {
-            Map<String, Object> map = new HashMap<>();
-            map.put("title", result.getTitle());
-            map.put("url", result.getUrl());
-            map.put("content", result.getContent());
-            map.put("score", result.getScore());
-            map.put("raw_content", result.getRawContent());
-            map.put("published_date", result.getPublishedDate());
-            resultsMap.add(map);
+            items.add(new SourceItem(
+                result.getTitle(),
+                result.getUrl(),
+                result.getContent(),
+                result.getScore(),
+                result.getPublishedDate(),
+                "Tavily"
+            ));
         }
-        return resultsMap;
+        return items;
     }
 }

@@ -3,6 +3,7 @@ package com.souyu.mediaengine.agent;
 import com.souyu.common.agent.AbstractAgent;
 import com.souyu.common.config.AgentConfig;
 import com.souyu.common.bocha.BochaClient;
+import com.souyu.common.dto.SourceItem;
 import com.souyu.common.tavily.model.TavilyResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,21 +55,23 @@ public class BochaAgent extends AbstractAgent<TavilyResponse> {
     }
 
     @Override
-    protected List<Map<String, Object>> extractSearchResults(TavilyResponse response) {
+    protected List<SourceItem> extractSearchResults(TavilyResponse response) {
         // 注意：这里的 response 实际上是 BochaToolsConfig 中转换后的 TavilyResponse
         if (response == null || response.getResults() == null) {
             return new ArrayList<>();
         }
 
-        List<Map<String, Object>> resultsMap = new ArrayList<>();
+        List<SourceItem> items = new ArrayList<>();
         for (var result : response.getResults()) {
-            Map<String, Object> map = new HashMap<>();
-            map.put("title", result.getTitle());
-            map.put("url", result.getUrl());
-            map.put("content", result.getContent());
-            map.put("published_date", result.getPublishedDate());
-            resultsMap.add(map);
+            items.add(new SourceItem(
+                result.getTitle(),
+                result.getUrl(),
+                result.getContent(),
+                result.getScore(),
+                result.getPublishedDate(),
+                "Bocha"
+            ));
         }
-        return resultsMap;
+        return items;
     }
 }
