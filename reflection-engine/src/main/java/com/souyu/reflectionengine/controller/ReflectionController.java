@@ -34,12 +34,11 @@ public class ReflectionController {
     @PostMapping
     public ResponseEntity<ReflectionResponse> reflect(@RequestBody ReflectionRequest request) {
         long startTime = System.currentTimeMillis();
-        log.info("[ReflectionController] 收到评判请求: taskId={}, 段落='{}', 轮次={}/{}, 搜索结果数={}",
+        log.info("[ReflectionController] 收到评判请求: taskId={}, 段落='{}', 轮次={}/{}",
                 request.taskId(),
                 request.paragraphTitle(),
                 request.reflectionRound() + 1,
-                request.maxReflections(),
-                request.searchResults() != null ? request.searchResults().size() : 0);
+                request.maxReflections());
 
         if (log.isDebugEnabled()) {
             log.debug("[ReflectionController] 请求详情: taskId={}, expected='{}', currentSummary长度={}",

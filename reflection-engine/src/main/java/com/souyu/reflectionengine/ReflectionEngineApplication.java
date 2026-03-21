@@ -16,7 +16,8 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
  * <p>排除不需要的 MongoDB 和 Redis 自动配置（本服务无状态，无需持久层）。
  */
 @SpringBootApplication(
-        scanBasePackages = {"com.souyu.reflectionengine", "com.souyu.common.client"},
+        scanBasePackages = {"com.souyu.reflectionengine", "com.souyu.common.client",
+                           "com.souyu.common.tavily", "com.souyu.common.bocha"},
         exclude = {
                 MongoAutoConfiguration.class,
                 MongoDataAutoConfiguration.class,

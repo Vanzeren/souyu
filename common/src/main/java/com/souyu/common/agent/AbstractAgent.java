@@ -205,7 +205,7 @@ public abstract class AbstractAgent<R> {
         String safeFirstSummaryContent = firstSummaryContent != null ? firstSummaryContent : "";
         producer.sendMessage("forum", Map.of("taskId", taskId, "content", safeFirstSummaryContent, "engine", engineName()));
 
-        // 3. 反思循环
+        // 3. 反思循环（评判-指导搜索 闭环）
         String currentSummary = safeFirstSummaryContent;
         int maxReflections = getAgentConfig().getSearch().getMaxReflections();
 
@@ -217,7 +217,66 @@ public abstract class AbstractAgent<R> {
             reflectionInputMap.put("title", paragraphSnapshot.getTitle());
             reflectionInputMap.put("paragraph_latest_state", currentSummary);
 
-            // Reflection Search
+            // =========================================================
+            // Reflection Engine 质量评判（LLM-as-Judge）
+            //
+            // 新顺序：先评判，再指导搜索
+            // 1. 基于当前搜索结果评判摘要质量
+            // 2. 若需继续，返回 nextSearchFocus 指导下轮搜索
+            // 3. 执行搜索并生成新摘要
+            // =========================================================
+            String nextSearchFocus = null;
+            boolean shouldContinue = true;
+
+            if (reflectionEngineClient != null) {
+                try {
+                    // 获取当前已积累的搜索结果 (Set A)
+                    List<SourceItem> agentSearchResults = getCurrentSearchResults(taskId, paragraphIndex);
+                    String agentSearchEngine = engineName().equals("media") ? "bocha" : "tavily";
+
+                    ReflectionRequest reflectionRequest = new ReflectionRequest(
+                            taskId,
+                            paragraphSnapshot.getTitle(),
+                            paragraphSnapshot.getContent(),
+                            currentSummary,
+                            agentSearchResults,
+                            i,
+                            maxReflections,
+                            engineName(),
+                            agentSearchEngine
+                    );
+
+                    // 1. 先评判
+                    ReflectionResponse reflectionResponse = reflectionEngineClient.reflect(reflectionRequest);
+
+                    logger.info("  [Reflection Judge] 质量分={} 建议={}",
+                            String.format("%.2f", reflectionResponse.qualityScore()),
+                            reflectionResponse.shouldContinue() ? "继续" : "早停");
+
+                    if (!reflectionResponse.identifiedGaps().isEmpty()) {
+                        logger.info("  [Reflection Judge] 知识缺口: {}", reflectionResponse.identifiedGaps());
+                    }
+
+                    shouldContinue = reflectionResponse.shouldContinue();
+                    nextSearchFocus = reflectionResponse.nextSearchFocus();
+
+                    // 2. 检查早停
+                    if (!shouldContinue) {
+                        logger.info("  [Reflection Judge] 段落 {} 质量达标，提前结束反思循环", paragraphIndex + 1);
+                        // 发送最终摘要
+                        producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+                        break;
+                    }
+
+                } catch (Exception e) {
+                    logger.warn("  [Reflection Judge] 调用 reflection-engine 失败，降级为原有策略: {}", e.getMessage());
+                    // 降级：无评判指导，按原逻辑搜索
+                    shouldContinue = true;
+                    nextSearchFocus = null;
+                }
+            }
+
+            // 3. 执行搜索（带评判建议指导）
             String reflectionPrompt = new PromptTemplate(DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION)
                     .create(Map.of(
                             "input_schema", toJson(reflectionInputMap),
@@ -225,93 +284,25 @@ public abstract class AbstractAgent<R> {
                     ))
                     .getContents();
 
-            String reflectionSearchResult = performSearch(taskId, paragraphSnapshot, reflectionPrompt);
+            String reflectionSearchResult;
+            if (nextSearchFocus != null && !nextSearchFocus.isBlank()) {
+                // 用 nextSearchFocus 增强搜索 Prompt
+                reflectionSearchResult = performSearchWithFocus(taskId, paragraphSnapshot, reflectionPrompt, nextSearchFocus);
+                logger.info("  [Reflection Search] 使用建议指导: {}", nextSearchFocus.substring(0, Math.min(50, nextSearchFocus.length())));
+            } else {
+                reflectionSearchResult = performSearch(taskId, paragraphSnapshot, reflectionPrompt);
+            }
             captureSearchResults(taskId, paragraphIndex, "Reflection Search " + (i + 1));
 
-            // =========================================================
-            // Reflection Engine 质量评判（LLM-as-Judge）
-            // 若 reflection-engine 未部署则跳过，维持原有行为
-            // =========================================================
-            String nextSearchFocus = null;
-            if (reflectionEngineClient != null) {
-                try {
-                    List<SourceItem> capturedResults = getCapturedSearchResults(taskId, paragraphIndex);
-                    ReflectionRequest reflectionRequest = new ReflectionRequest(
-                            taskId,
-                            paragraphSnapshot.getTitle(),
-                            paragraphSnapshot.getContent(),
-                            currentSummary,
-                            capturedResults,
-                            i,
-                            maxReflections,
-                            engineName()
-                    );
-                    ReflectionResponse reflectionResponse = reflectionEngineClient.reflect(reflectionRequest);
+            // 4. 生成新摘要
+            String updatedSummaryContent = generateReflectionSummary(
+                    reflectionInputMap, reflectionSearchResult, null); // nextSearchFocus 已在搜索阶段使用
+            String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
+            currentSummary = safeUpdatedSummaryContent;
+            updateParagraphSummary(taskId, paragraphIndex, currentSummary);
 
-                    logger.info("  [Reflection Judge] 质量分={} 早停={}",
-                            String.format("%.2f", reflectionResponse.qualityScore()),
-                            !reflectionResponse.shouldContinue());
-
-                    if (!reflectionResponse.identifiedGaps().isEmpty()) {
-                        logger.info("  [Reflection Judge] 知识缺口: {}", reflectionResponse.identifiedGaps());
-                    }
-
-                    if (!reflectionResponse.shouldContinue()) {
-                        logger.info("  [Reflection Judge] 段落 {} 质量达标，提前结束反思循环", paragraphIndex + 1);
-                        // 仍然执行本轮摘要更新后 break
-                        nextSearchFocus = null;
-                    } else {
-                        nextSearchFocus = reflectionResponse.nextSearchFocus();
-                    }
-
-                    // 执行本轮 Reflection Summary（无论是否早停都要合并本轮已搜到的内容）
-                    String updatedSummaryContent = generateReflectionSummary(
-                            reflectionInputMap, reflectionSearchResult, nextSearchFocus);
-                    String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
-                    currentSummary = safeUpdatedSummaryContent;
-                    updateParagraphSummary(taskId, paragraphIndex, currentSummary);
-
-                    if (!reflectionResponse.shouldContinue()) {
-                        // 早停：发送最终摘要到 forum，然后跳出循环
-                        if (i == maxReflections - 1 || !reflectionResponse.shouldContinue()) {
-                            producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
-                        }
-                        break;
-                    }
-
-                } catch (Exception e) {
-                    logger.warn("  [Reflection Judge] 调用 reflection-engine 失败，降级为原有策略: {}", e.getMessage());
-                    // 降级：按原有逻辑处理本轮
-                    String updatedSummaryContent = generateContent(
-                            DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
-                            reflectionInputMap,
-                            reflectionSearchResult,
-                            UpdatedSummaryResult.class,
-                            UpdatedSummaryResult::updated_paragraph_latest_state
-                    );
-                    String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
-                    currentSummary = safeUpdatedSummaryContent;
-                    updateParagraphSummary(taskId, paragraphIndex, currentSummary);
-                    if (i == maxReflections - 1) {
-                        producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
-                    }
-                }
-            } else {
-                // reflection-engine 未部署：原有行为
-                String updatedSummaryContent = generateContent(
-                        DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
-                        reflectionInputMap,
-                        reflectionSearchResult,
-                        UpdatedSummaryResult.class,
-                        UpdatedSummaryResult::updated_paragraph_latest_state
-                );
-                String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
-                currentSummary = safeUpdatedSummaryContent;
-                updateParagraphSummary(taskId, paragraphIndex, currentSummary);
-                if (i == maxReflections - 1) {
-                    producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
-                }
-            }
+            // 每轮结束都发送更新（便于前端实时查看）
+            producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
         }
 
         stateManager.executeUpdate(taskId, s -> s.getParagraph(paragraphIndex).getResearch().markCompleted());
@@ -370,10 +361,26 @@ public abstract class AbstractAgent<R> {
     }
 
     private String performSearch(String taskId, Paragraph paragraph, String userPrompt) {
+        return performSearchWithFocus(taskId, paragraph, userPrompt, null);
+    }
+
+    /**
+     * 执行搜索，可携带 Reflection Judge 的指导建议。
+     *
+     * @param nextSearchFocus Reflection Judge 给出的补充搜索方向，若为 null 则按原逻辑搜索
+     */
+    private String performSearchWithFocus(String taskId, Paragraph paragraph, String userPrompt, String nextSearchFocus) {
         SearchContext.clear();
         try {
+            // 如果有指导建议，注入到 Prompt 末尾
+            String augmentedPrompt = userPrompt;
+            if (nextSearchFocus != null && !nextSearchFocus.isBlank()) {
+                augmentedPrompt = userPrompt + "\n\n**[补充指导]** 本次搜索请特别关注以下方向：\n" + nextSearchFocus;
+                logger.debug("[AbstractAgent] 搜索时注入指导: {}", nextSearchFocus);
+            }
+
             ChatResponse chatResponse = chatClient.callWithFunctions(
-                    new org.springframework.ai.chat.prompt.Prompt(userPrompt),
+                    new org.springframework.ai.chat.prompt.Prompt(augmentedPrompt),
                     getToolNames()
             );
             String reasoning = chatResponse.getResult().getOutput().getContent();
@@ -414,40 +421,44 @@ public abstract class AbstractAgent<R> {
         SearchContext.clear();
     }
 
-    // 限制传递给 reflection-engine 的搜索结果数量
-    private static final int MAX_REFLECTION_SEARCH_RESULTS = 10;
+
+    // 限制传给 reflection-engine 的搜索结果数量
+    private static final int MAX_AGENT_RESULTS_FOR_REFLECTION = 8;
 
     /**
-     * 从 State 的 searchHistory 中提取最近一轮搜索捕获的 SourceItem 列表，
-     * 用于构建 ReflectionRequest 中的 searchResults 字段。
+     * 获取当前段落本轮实际使用的搜索结果（用于传给 reflection-engine 进行双视角验证）。
      *
-     * <p>由于 captureSearchResults() 在每次搜索后追加到 searchHistory，
-     * 这里取 history 中最后一批（直到遇到不同的 queryDescription 前缀）。
-     * 限制数量避免 reflection-engine 的 prompt 过大。
+     * <p>只取最近一轮搜索的结果，避免累积过多。限制数量防止 prompt 过大。
      */
-    private List<SourceItem> getCapturedSearchResults(String taskId, Integer paragraphIndex) {
+    private List<SourceItem> getCurrentSearchResults(String taskId, Integer paragraphIndex) {
         State state = stateManager.getState(taskId);
         if (state == null) return List.of();
         Paragraph paragraph = state.getParagraph(paragraphIndex);
         if (paragraph == null || paragraph.getResearch() == null) return List.of();
 
-        List<SourceItem> allResults = paragraph.getResearch().getSearchHistory().stream()
+        List<Search> history = paragraph.getResearch().getSearchHistory();
+        if (history.isEmpty()) return List.of();
+
+        // 只取最近添加的搜索结果（假设是本轮的）
+        // 从后往前取，限制数量
+        int size = history.size();
+        int startIndex = Math.max(0, size - MAX_AGENT_RESULTS_FOR_REFLECTION);
+
+        return history.subList(startIndex, size).stream()
                 .map(search -> new SourceItem(
                         search.getTitle(),
                         search.getUrl(),
-                        search.getContent(),
+                        truncateContent(search.getContent(), 150), // 截断内容
                         search.getScore(),
                         search.getTimestamp(),
                         "captured"
                 ))
                 .collect(Collectors.toList());
+    }
 
-        if (allResults.size() > MAX_REFLECTION_SEARCH_RESULTS) {
-            logger.info("[AbstractAgent] 搜索结果 {} 条，截取前 {} 条传给 reflection-engine",
-                    allResults.size(), MAX_REFLECTION_SEARCH_RESULTS);
-            return allResults.subList(0, MAX_REFLECTION_SEARCH_RESULTS);
-        }
-        return allResults;
+    private String truncateContent(String content, int maxLength) {
+        if (content == null || content.length() <= maxLength) return content;
+        return content.substring(0, maxLength) + "...";
     }
 
     /**
@@ -565,14 +576,6 @@ public abstract class AbstractAgent<R> {
         } catch (Exception e) {
             logger.error("保存报告失败: {}", e.getMessage());
         }
-    }
-
-    public Map<String, Object> getProgressSummary(String taskId) {
-        State state = stateManager.getState(taskId);
-        if (state != null) {
-            return state.getProgressSummary();
-        }
-        return new HashMap<>();
     }
 
     protected abstract List<SourceItem> extractSearchResults(R response);

@@ -1,10 +1,15 @@
 package com.souyu.reflectionengine.service.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.souyu.common.bocha.BochaClient;
+import com.souyu.common.bocha.model.BochaResponse;
+import com.souyu.common.bocha.model.WebResult;
 import com.souyu.common.client.TimeContextChatClient;
 import com.souyu.common.dto.SourceItem;
 import com.souyu.common.dto.reflection.ReflectionRequest;
 import com.souyu.common.dto.reflection.ReflectionResponse;
+import com.souyu.common.tavily.TavilyClient;
+import com.souyu.common.tavily.model.TavilyResponse;
 import com.souyu.reflectionengine.dto.JudgeResult;
 import com.souyu.reflectionengine.prompt.ReflectionJudgePrompt;
 import com.souyu.reflectionengine.service.ReflectionService;
@@ -17,23 +22,29 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Reflection Engine 服务实现。
  *
- * <p>核心逻辑：
+ * <p>核心逻辑（双视角交叉验证）：
  * <ol>
- *   <li>将 {@link ReflectionRequest} 格式化为 LLM Judge Prompt</li>
- *   <li>调用 {@link TimeContextChatClient} 获取 LLM 评判结果</li>
- *   <li>用 {@link BeanOutputConverter} 解析 JSON 响应为 {@link JudgeResult}</li>
- *   <li>根据 qualityScore 和 reflectionRound 决定是否早停</li>
- *   <li>返回 {@link ReflectionResponse}</li>
+ *   <li>接收 {@link ReflectionRequest}，包含 AbstractAgent 实际使用的搜索结果</li>
+ *   <li>使用<em>另一种</em>搜索引擎（Tavily/Bocha）独立搜索，获得补充视角</li>
+ *   <li>将两种搜索结果一并送入 Prompt：
+ *     <ul>
+ *       <li>Set A: AbstractAgent 实际使用的搜索结果</li>
+ *       <li>Set B: ReflectionEngine 用另一种引擎搜到的结果（用于发现遗漏）</li>
+ *     </ul>
+ *   </li>
+ *   <li>LLM 评判 {@link #currentSummary} 是否充分利用了 Set A，以及 Set B 中有哪些重要遗漏</li>
+ *   <li>输出改进建议和下一轮的搜索方向（针对 Set B 中的高价值遗漏）</li>
  * </ol>
  *
- * <p>运行在 Java 21 虚拟线程上（由 Tomcat 的 VirtualThreadTaskExecutor 调度），
- * 无需显式配置线程池。
+ * <p>运行在 Java 21 虚拟线程上（由 Tomcat 的 VirtualThreadTaskExecutor 调度）。
  */
 @Slf4j
 @Service
@@ -42,8 +53,17 @@ public class ReflectionServiceImpl implements ReflectionService {
     @Autowired
     private TimeContextChatClient chatClient;
 
+    @Autowired(required = false)
+    private TavilyClient tavilyClient;
+
+    @Autowired(required = false)
+    private BochaClient bochaClient;
+
     @Value("${app.reflection.quality-threshold:0.75}")
     private double qualityThreshold;
+
+    @Value("${app.reflection.search.max-results:5}")
+    private int maxReflectionSearchResults;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -53,22 +73,28 @@ public class ReflectionServiceImpl implements ReflectionService {
         log.info("[ReflectionService] 开始评判 taskId={} 段落='{}' 轮次={}/{}",
                 request.taskId(), request.paragraphTitle(),
                 request.reflectionRound() + 1, request.maxReflections());
+        log.info("[ReflectionService] AbstractAgent 使用 {}, Reflection 将使用 {} 进行补充验证",
+                request.agentSearchEngine(), request.getReflectionSearchEngine());
 
         try {
-            // 1. 构建 BeanOutputConverter 以生成 JSON Schema 并解析响应
+            // 1. AbstractAgent 实际使用的搜索结果（Set A）
+            List<SourceItem> agentResults = request.agentSearchResults() != null
+                    ? request.agentSearchResults()
+                    : List.of();
+
+            // 2. ReflectionEngine 用另一种引擎独立搜索（Set B）
+            List<SourceItem> reflectionResults = performSupplementarySearch(request);
+
+            // 3. 构建对比分析的 Prompt
             BeanOutputConverter<JudgeResult> converter = new BeanOutputConverter<>(JudgeResult.class);
 
-            // 2. 格式化搜索结果为可读文本
-            String formattedSearchResults = formatSearchResults(request.searchResults());
-            int searchResultCount = request.searchResults() != null ? request.searchResults().size() : 0;
-
-            // 3. 填充 Prompt 模板
             String promptContent = new PromptTemplate(ReflectionJudgePrompt.JUDGE_PROMPT)
                     .create(Map.of(
                             "paragraph_title", safe(request.paragraphTitle()),
                             "paragraph_expected", safe(request.paragraphExpected()),
                             "current_summary", safe(request.currentSummary()),
-                            "search_results", formattedSearchResults,
+                            "agent_search_results", formatAgentResults(agentResults),
+                            "reflection_search_results", formatReflectionResults(reflectionResults),
                             "reflection_round", String.valueOf(request.reflectionRound() + 1),
                             "max_reflections", String.valueOf(request.maxReflections()),
                             "quality_threshold", String.valueOf(qualityThreshold),
@@ -77,22 +103,14 @@ public class ReflectionServiceImpl implements ReflectionService {
                     .getContents();
 
             int promptLength = promptContent.length();
-            log.info("[ReflectionService] Prompt构建完成: taskId={}, 搜索结果数={}, Prompt长度={}字符",
-                    request.taskId(), searchResultCount, promptLength);
+            log.info("[ReflectionService] Prompt构建完成: taskId={}, Agent结果={}, Reflection结果={}, Prompt长度={}字符",
+                    request.taskId(), agentResults.size(), reflectionResults.size(), promptLength);
 
-            if (log.isDebugEnabled()) {
-                log.debug("[ReflectionService] Prompt内容预览(前500字符): taskId={}, content='{}...'",
-                        request.taskId(),
-                        promptContent.substring(0, Math.min(500, promptContent.length())));
-            }
-
-            // 4. 调用 LLM（通过 TimeContextChatClient 自动添加时间戳上下文）
+            // 4. 调用 LLM 评判（使用流式传输避免超时）
             long llmStartTime = System.currentTimeMillis();
             String jsonResponse = chatClient
-                    .call(new Prompt(promptContent))
-                    .getResult()
-                    .getOutput()
-                    .getContent();
+                    .streamAndCollect(new Prompt(promptContent))
+                    .block(); // 等待流式响应完成
             long llmDuration = System.currentTimeMillis() - llmStartTime;
 
             log.info("[ReflectionService] LLM调用完成: taskId={}, LLM耗时={}ms, 响应长度={}字符",
@@ -104,65 +122,11 @@ public class ReflectionServiceImpl implements ReflectionService {
                 return defaultContinueResponse(request);
             }
 
-            if (log.isDebugEnabled()) {
-                log.debug("[ReflectionService] LLM原始响应: taskId={}, response='{}'",
-                        request.taskId(),
-                        jsonResponse.substring(0, Math.min(1000, jsonResponse.length())));
-            }
-
-            // 5. 解析 LLM 输出
+            // 5. 解析并处理结果
             JudgeResult judgeResult = parseJudgeResult(converter, jsonResponse, request);
-
-            // 6. 强制早停条件检查（LLM 可能未遵守约束）
-            boolean shouldContinue = judgeResult.shouldContinue();
-            String stopReason = null;
-
-            if (judgeResult.qualityScore() >= qualityThreshold) {
-                shouldContinue = false;
-                stopReason = "质量分达标";
-                log.info("[ReflectionService] 质量分{} >= 阈值{}，强制早停: taskId={}",
-                        String.format("%.2f", judgeResult.qualityScore()),
-                        qualityThreshold, request.taskId());
-            }
-            if (request.reflectionRound() >= request.maxReflections() - 1) {
-                shouldContinue = false;
-                stopReason = "已达最大轮次";
-                log.info("[ReflectionService] 已达最大轮次{}，强制早停: taskId={}",
-                        request.maxReflections(), request.taskId());
-            }
-
-            long totalDuration = System.currentTimeMillis() - startTime;
-            log.info("[ReflectionService] 评判完成: taskId={}, 总分={:.2f}, 覆盖={:.1f}, 深度={:.1f}, " +
-                            "多样性={:.1f}, 时效={:.1f}, 密度={:.1f}, 早停={}, 原因={}, 总耗时={}ms",
-                    request.taskId(),
-                    judgeResult.qualityScore(),
-                    judgeResult.coverageScore(), judgeResult.depthScore(),
-                    judgeResult.diversityScore(), judgeResult.recencyScore(),
-                    judgeResult.densityScore(),
-                    !shouldContinue,
-                    stopReason != null ? stopReason : "继续搜索",
-                    totalDuration);
-
-            if (shouldContinue && judgeResult.nextSearchFocus() != null) {
-                log.info("[ReflectionService] 下一轮搜索方向: taskId={}, focus='{}'",
-                        request.taskId(), judgeResult.nextSearchFocus());
-            }
-
-            if (judgeResult.identifiedGaps() != null && !judgeResult.identifiedGaps().isEmpty()) {
-                log.info("[ReflectionService] 识别的知识缺口: taskId={}, gaps={}",
-                        request.taskId(), judgeResult.identifiedGaps());
-            }
-
-            return new ReflectionResponse(
-                    shouldContinue,
-                    judgeResult.qualityScore(),
-                    judgeResult.identifiedGaps() != null ? judgeResult.identifiedGaps() : List.of(),
-                    judgeResult.nextSearchFocus(),
-                    judgeResult.reflectionSummary()
-            );
+            return processJudgeResult(judgeResult, request, startTime);
 
         } catch (org.springframework.web.client.RestClientException e) {
-            // API 调用失败（认证错误、超时等），降级处理
             long totalDuration = System.currentTimeMillis() - startTime;
             log.error("[ReflectionService] LLM API 调用失败，降级为默认策略: taskId={}, 总耗时={}ms, 错误={}",
                     request.taskId(), totalDuration, e.getMessage());
@@ -171,71 +135,148 @@ public class ReflectionServiceImpl implements ReflectionService {
             long totalDuration = System.currentTimeMillis() - startTime;
             log.error("[ReflectionService] 评判异常: taskId={}, 总耗时={}ms, 错误={}",
                     request.taskId(), totalDuration, e.getMessage(), e);
-            // 容错：任何异常不影响主流程，默认继续搜索
             return defaultContinueResponse(request);
         }
     }
 
-    // 搜索结果截断配置
-    private static final int MAX_SEARCH_RESULTS = 10;      // 最多取前 10 条
-    private static final int MAX_CONTENT_LENGTH = 200;     // 每条内容最多 200 字符
+    /**
+     * 使用另一种搜索引擎进行补充搜索，用于发现 AbstractAgent 可能遗漏的信息。
+     */
+    private List<SourceItem> performSupplementarySearch(ReflectionRequest request) {
+        String searchQuery = request.toSearchQuery();
+        String engine = request.getReflectionSearchEngine();
+        log.info("[ReflectionService] 开始补充搜索: taskId={}, engine='{}', query='{}'",
+                request.taskId(), engine, searchQuery);
+
+        List<SourceItem> results = new ArrayList<>();
+
+        try {
+            if (request.useTavilyForReflection() && tavilyClient != null) {
+                TavilyResponse response = tavilyClient.basicSearchNews(searchQuery, maxReflectionSearchResults);
+                if (response != null && response.getResults() != null) {
+                    results = response.getResults().stream()
+                            .map(r -> new SourceItem(
+                                    r.getTitle(), r.getUrl(), r.getContent(),
+                                    r.getScore(), r.getPublishedDate(), "Tavily"
+                            ))
+                            .collect(Collectors.toList());
+                }
+            } else if (request.useBochaForReflection() && bochaClient != null) {
+                BochaResponse response = bochaClient.webSearchOnly(searchQuery, maxReflectionSearchResults);
+                if (response != null && response.getWebpages() != null) {
+                    results = response.getWebpages().stream()
+                            .map(r -> new SourceItem(
+                                    r.getName(), r.getUrl(), r.getSnippet(),
+                                    null, r.getDatePublished(), "Bocha"
+                            ))
+                            .collect(Collectors.toList());
+                }
+            }
+
+            log.info("[ReflectionService] 补充搜索完成: taskId={}, engine='{}', 结果数={}",
+                    request.taskId(), engine, results.size());
+        } catch (Exception e) {
+            log.warn("[ReflectionService] 补充搜索失败: taskId={}, engine='{}', error={}",
+                    request.taskId(), engine, e.getMessage());
+        }
+
+        return results;
+    }
 
     /**
-     * 将搜索结果格式化为 Prompt 可读文本。
-     * <p>限制数量和长度避免超出 token 限制。
+     * 格式化 AbstractAgent 的搜索结果（Set A）。
      */
-    private String formatSearchResults(List<SourceItem> results) {
+    private String formatAgentResults(List<SourceItem> results) {
         if (results == null || results.isEmpty()) {
-            log.debug("[ReflectionService] 搜索结果为空");
-            return "（本轮无搜索结果）";
+            return "（无搜索结果）";
         }
+        return formatResultsInternal(results, "【当前实际使用的搜索结果】");
+    }
 
-        int originalSize = results.size();
-        int limit = Math.min(originalSize, MAX_SEARCH_RESULTS);
-        log.info("[ReflectionService] 格式化搜索结果: 原始{}条, 取前{}条", originalSize, limit);
+    /**
+     * 格式化 ReflectionEngine 的补充搜索结果（Set B）。
+     */
+    private String formatReflectionResults(List<SourceItem> results) {
+        if (results == null || results.isEmpty()) {
+            return "（补充搜索未返回结果）";
+        }
+        return formatResultsInternal(results, "【补充搜索发现的潜在信息】");
+    }
 
+    private static final int MAX_CONTENT_LENGTH = 120;
+
+    private String formatResultsInternal(List<SourceItem> results, String header) {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < limit; i++) {
+        sb.append(header).append(" (").append(results.size()).append("条)\n");
+
+        for (int i = 0; i < results.size(); i++) {
             SourceItem item = results.get(i);
             sb.append(i + 1).append(". ");
-            sb.append("[").append(item.source() != null ? item.source() : "Unknown").append("] ");
-            if (item.title() != null) sb.append("**").append(item.title()).append("**\n");
-            if (item.score() != null) sb.append("   相关度: ").append(String.format("%.2f", item.score())).append("\n");
+            if (item.title() != null) sb.append(item.title()).append("\n");
             if (item.content() != null) {
                 String content = item.content();
-                if (content.length() > MAX_CONTENT_LENGTH) {
-                    content = content.substring(0, MAX_CONTENT_LENGTH) + "...";
-                }
-                sb.append("   摘要: ").append(content).append("\n");
+                if (content.length() > MAX_CONTENT_LENGTH) content = content.substring(0, MAX_CONTENT_LENGTH) + "...";
+                sb.append("   ").append(content).append("\n");
             }
-            sb.append("\n");
         }
-
-        if (originalSize > MAX_SEARCH_RESULTS) {
-            sb.append("... (还有 ").append(originalSize - MAX_SEARCH_RESULTS).append(" 条结果已省略)\n");
-        }
-
         return sb.toString();
     }
 
     /**
-     * 解析 LLM 输出，带 fallback 降级：
-     * 先用 BeanOutputConverter，失败则尝试 JSON 手动解析，最终降级为默认继续策略。
+     * 处理 LLM 评判结果，应用早停逻辑。
+     */
+    private ReflectionResponse processJudgeResult(JudgeResult judgeResult,
+                                                   ReflectionRequest request,
+                                                   long startTime) {
+        boolean shouldContinue = judgeResult.shouldContinue();
+        String stopReason = null;
+
+        if (judgeResult.qualityScore() >= qualityThreshold) {
+            shouldContinue = false;
+            stopReason = "质量分达标";
+            log.info("[ReflectionService] 质量分{} >= 阈值{}，强制早停: taskId={}",
+                    String.format("%.2f", judgeResult.qualityScore()),
+                    qualityThreshold, request.taskId());
+        }
+        if (request.reflectionRound() >= request.maxReflections() - 1) {
+            shouldContinue = false;
+            stopReason = "已达最大轮次";
+            log.info("[ReflectionService] 已达最大轮次{}，强制早停: taskId={}",
+                    request.maxReflections(), request.taskId());
+        }
+
+        long totalDuration = System.currentTimeMillis() - startTime;
+        log.info("[ReflectionService] 评判完成: taskId={}, 总分={:.2f}, 早停={}, 原因={}, 总耗时={}ms",
+                request.taskId(), judgeResult.qualityScore(),
+                !shouldContinue, stopReason != null ? stopReason : "继续搜索", totalDuration);
+
+        if (shouldContinue && judgeResult.nextSearchFocus() != null) {
+            log.info("[ReflectionService] 下一轮搜索方向: taskId={}, focus='{}'",
+                    request.taskId(), judgeResult.nextSearchFocus());
+        }
+
+        return new ReflectionResponse(
+                shouldContinue,
+                judgeResult.qualityScore(),
+                judgeResult.identifiedGaps() != null ? judgeResult.identifiedGaps() : List.of(),
+                judgeResult.nextSearchFocus(),
+                judgeResult.reflectionSummary()
+        );
+    }
+
+    /**
+     * 解析 LLM 输出，带 fallback 降级。
      */
     private JudgeResult parseJudgeResult(BeanOutputConverter<JudgeResult> converter,
                                           String jsonResponse,
                                           ReflectionRequest request) {
-        // 尝试主路径解析
         try {
-            JudgeResult result = converter.convert(jsonResponse);
-            log.debug("[ReflectionService] BeanOutputConverter解析成功: taskId={}", request.taskId());
-            return result;
+            return converter.convert(jsonResponse);
         } catch (Exception e) {
             log.warn("[ReflectionService] BeanOutputConverter解析失败，尝试手动解析: taskId={}, error={}",
                     request.taskId(), e.getMessage());
         }
 
-        // 尝试手动 JSON 解析
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> rawMap = objectMapper.readValue(jsonResponse, Map.class);
@@ -246,31 +287,18 @@ public class ReflectionServiceImpl implements ReflectionService {
                     ? (List<String>) gapList : new ArrayList<>();
             String focus = rawMap.get("next_search_focus") instanceof String s ? s : "";
             String summary = rawMap.get("reflection_summary") instanceof String s ? s : "";
-            log.info("[ReflectionService] 手动JSON解析成功: taskId={}, qualityScore={}",
-                    request.taskId(), qs);
             return new JudgeResult(qs, sc, gaps, focus, summary, 0, 0, 0, 0, 0);
         } catch (Exception ex) {
             log.error("[ReflectionService] 手动JSON解析也失败: taskId={}, error={}",
                     request.taskId(), ex.getMessage());
-            // 最终降级：保守的默认值
             return new JudgeResult(0.5, true, List.of(), "", "解析失败，采用默认策略", 0, 0, 0, 0, 0);
         }
     }
 
-    /**
-     * 异常或空响应时的默认"继续搜索"响应（容错降级）。
-     */
     private ReflectionResponse defaultContinueResponse(ReflectionRequest request) {
         boolean shouldContinue = request.reflectionRound() < request.maxReflections() - 1;
-        log.warn("[ReflectionService] 使用默认降级响应: taskId={}, shouldContinue={}, qualityScore=0.5",
-                request.taskId(), shouldContinue);
-        return new ReflectionResponse(
-                shouldContinue,
-                0.5,
-                List.of(),
-                null,
-                "Reflection 服务异常，采用默认策略"
-        );
+        return new ReflectionResponse(shouldContinue, 0.5, List.of(), null,
+                "Reflection 服务异常，采用默认策略");
     }
 
     private String safe(String value) {
