@@ -30,6 +30,9 @@ public class TaskStatusManager {
     @Autowired
     private RedissonClient redissonClient;
 
+    @Autowired
+    private HeartbeatBuffer heartbeatBuffer;
+
     /**
      * 初始化任务状态
      */
@@ -72,16 +75,21 @@ public class TaskStatusManager {
     
     /**
      * 刷新任务更新时间 (心跳)
-     * 这是一个轻量级操作，不需要加锁，直接使用 updateFirst
+     * 使用 HeartbeatBuffer 缓冲批量写入，减少 MongoDB 写压力。
      */
     public void refreshUpdateTime(String taskId) {
-        Query query = new Query(Criteria.where("_id").is(taskId));
-        Update update = new Update().set("updatedAt", LocalDateTime.now());
-        
-        // 打印日志以确认调用
-        logger.info("Heartbeat: Refreshing update time for task: {}", taskId);
-        
-        mongoTemplate.updateFirst(query, update, TaskStatus.class);
+        // 改为缓冲写入，每 10 秒批量刷盘
+        heartbeatBuffer.buffer(taskId);
+        logger.debug("Heartbeat buffered for task: {}", taskId);
+    }
+
+    /**
+     * 立即刷新任务更新时间（同步写入）
+     * 在任务结束时调用，确保数据立即持久化
+     */
+    public void refreshUpdateTimeImmediately(String taskId) {
+        heartbeatBuffer.flushImmediately(taskId);
+        logger.info("Heartbeat immediately flushed for task: {}", taskId);
     }
 
     /**
