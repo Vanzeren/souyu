@@ -1,11 +1,14 @@
 package com.souyu.common.agent;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.souyu.common.client.ReflectionEngineClient;
 import com.souyu.common.config.AgentConfig;
 import com.souyu.common.context.SearchContext;
 import com.souyu.common.dto.SourceItem;
 import com.souyu.common.dto.SummaryResult;
 import com.souyu.common.dto.UpdatedSummaryResult;
+import com.souyu.common.dto.reflection.ReflectionRequest;
+import com.souyu.common.dto.reflection.ReflectionResponse;
 import com.souyu.common.manager.StateManager;
 import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
@@ -13,6 +16,7 @@ import com.souyu.common.node.querynode.QueryFormattingNode;
 import com.souyu.common.node.querynode.ReportStructureNode;
 import com.souyu.common.producer.messageProducer;
 import com.souyu.common.state.Paragraph;
+import com.souyu.common.state.Search;
 import com.souyu.common.state.State;
 import com.souyu.common.client.TimeContextChatClient;
 import com.souyu.common.prompt.DeepSearchPrompts;
@@ -63,6 +67,14 @@ public abstract class AbstractAgent<R> {
 
     @Autowired
     private messageProducer producer;
+
+    /**
+     * Feign client for the reflection-engine microservice.
+     * Optional injection: if reflection-engine is not deployed, the agent falls back
+     * to the original fixed-iteration behavior (backward-compatible).
+     */
+    @Autowired(required = false)
+    private ReflectionEngineClient reflectionEngineClient;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -216,24 +228,89 @@ public abstract class AbstractAgent<R> {
             String reflectionSearchResult = performSearch(taskId, paragraphSnapshot, reflectionPrompt);
             captureSearchResults(taskId, paragraphIndex, "Reflection Search " + (i + 1));
 
-            // Reflection Summary
-            String updatedSummaryContent = generateContent(
-                    DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
-                    reflectionInputMap,
-                    reflectionSearchResult,
-                    UpdatedSummaryResult.class,
-                    UpdatedSummaryResult::updated_paragraph_latest_state
-            );
+            // =========================================================
+            // Reflection Engine 质量评判（LLM-as-Judge）
+            // 若 reflection-engine 未部署则跳过，维持原有行为
+            // =========================================================
+            String nextSearchFocus = null;
+            if (reflectionEngineClient != null) {
+                try {
+                    List<SourceItem> capturedResults = getCapturedSearchResults(taskId, paragraphIndex);
+                    ReflectionRequest reflectionRequest = new ReflectionRequest(
+                            taskId,
+                            paragraphSnapshot.getTitle(),
+                            paragraphSnapshot.getContent(),
+                            currentSummary,
+                            capturedResults,
+                            i,
+                            maxReflections,
+                            engineName()
+                    );
+                    ReflectionResponse reflectionResponse = reflectionEngineClient.reflect(reflectionRequest);
 
-            logger.info("段落 {} 反思 {} 更新总结:\n{}", paragraphIndex + 1, i + 1, updatedSummaryContent);
+                    logger.info("  [Reflection Judge] 质量分={} 早停={}",
+                            String.format("%.2f", reflectionResponse.qualityScore()),
+                            !reflectionResponse.shouldContinue());
 
-            // 修复 NPE: 确保 content 不为 null
-            String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
-            currentSummary = safeUpdatedSummaryContent;
-            updateParagraphSummary(taskId, paragraphIndex, currentSummary);
+                    if (!reflectionResponse.identifiedGaps().isEmpty()) {
+                        logger.info("  [Reflection Judge] 知识缺口: {}", reflectionResponse.identifiedGaps());
+                    }
 
-            if (i == maxReflections - 1) {
-                producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+                    if (!reflectionResponse.shouldContinue()) {
+                        logger.info("  [Reflection Judge] 段落 {} 质量达标，提前结束反思循环", paragraphIndex + 1);
+                        // 仍然执行本轮摘要更新后 break
+                        nextSearchFocus = null;
+                    } else {
+                        nextSearchFocus = reflectionResponse.nextSearchFocus();
+                    }
+
+                    // 执行本轮 Reflection Summary（无论是否早停都要合并本轮已搜到的内容）
+                    String updatedSummaryContent = generateReflectionSummary(
+                            reflectionInputMap, reflectionSearchResult, nextSearchFocus);
+                    String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
+                    currentSummary = safeUpdatedSummaryContent;
+                    updateParagraphSummary(taskId, paragraphIndex, currentSummary);
+
+                    if (!reflectionResponse.shouldContinue()) {
+                        // 早停：发送最终摘要到 forum，然后跳出循环
+                        if (i == maxReflections - 1 || !reflectionResponse.shouldContinue()) {
+                            producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+                        }
+                        break;
+                    }
+
+                } catch (Exception e) {
+                    logger.warn("  [Reflection Judge] 调用 reflection-engine 失败，降级为原有策略: {}", e.getMessage());
+                    // 降级：按原有逻辑处理本轮
+                    String updatedSummaryContent = generateContent(
+                            DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
+                            reflectionInputMap,
+                            reflectionSearchResult,
+                            UpdatedSummaryResult.class,
+                            UpdatedSummaryResult::updated_paragraph_latest_state
+                    );
+                    String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
+                    currentSummary = safeUpdatedSummaryContent;
+                    updateParagraphSummary(taskId, paragraphIndex, currentSummary);
+                    if (i == maxReflections - 1) {
+                        producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+                    }
+                }
+            } else {
+                // reflection-engine 未部署：原有行为
+                String updatedSummaryContent = generateContent(
+                        DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY,
+                        reflectionInputMap,
+                        reflectionSearchResult,
+                        UpdatedSummaryResult.class,
+                        UpdatedSummaryResult::updated_paragraph_latest_state
+                );
+                String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
+                currentSummary = safeUpdatedSummaryContent;
+                updateParagraphSummary(taskId, paragraphIndex, currentSummary);
+                if (i == maxReflections - 1) {
+                    producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+                }
             }
         }
 
@@ -335,6 +412,97 @@ public abstract class AbstractAgent<R> {
             logger.warn("No structured search results captured for paragraph {}", paragraphIndex + 1);
         }
         SearchContext.clear();
+    }
+
+    // 限制传递给 reflection-engine 的搜索结果数量
+    private static final int MAX_REFLECTION_SEARCH_RESULTS = 10;
+
+    /**
+     * 从 State 的 searchHistory 中提取最近一轮搜索捕获的 SourceItem 列表，
+     * 用于构建 ReflectionRequest 中的 searchResults 字段。
+     *
+     * <p>由于 captureSearchResults() 在每次搜索后追加到 searchHistory，
+     * 这里取 history 中最后一批（直到遇到不同的 queryDescription 前缀）。
+     * 限制数量避免 reflection-engine 的 prompt 过大。
+     */
+    private List<SourceItem> getCapturedSearchResults(String taskId, Integer paragraphIndex) {
+        State state = stateManager.getState(taskId);
+        if (state == null) return List.of();
+        Paragraph paragraph = state.getParagraph(paragraphIndex);
+        if (paragraph == null || paragraph.getResearch() == null) return List.of();
+
+        List<SourceItem> allResults = paragraph.getResearch().getSearchHistory().stream()
+                .map(search -> new SourceItem(
+                        search.getTitle(),
+                        search.getUrl(),
+                        search.getContent(),
+                        search.getScore(),
+                        search.getTimestamp(),
+                        "captured"
+                ))
+                .collect(Collectors.toList());
+
+        if (allResults.size() > MAX_REFLECTION_SEARCH_RESULTS) {
+            logger.info("[AbstractAgent] 搜索结果 {} 条，截取前 {} 条传给 reflection-engine",
+                    allResults.size(), MAX_REFLECTION_SEARCH_RESULTS);
+            return allResults.subList(0, MAX_REFLECTION_SEARCH_RESULTS);
+        }
+        return allResults;
+    }
+
+    /**
+     * 生成反思摘要，将 Reflection Judge 給出的 nextSearchFocus 作为补充约束注入 Prompt 末尾。
+     *
+     * <p>若 nextSearchFocus 不为空，则在原有 SYSTEM_PROMPT_REFLECTION_SUMMARY 的基础上
+     * 追加约束说明，让 LLM 在合并内容时优先关注缺口方向——而不改变 Function Calling 机制。
+     *
+     * @param reflectionInputMap  包含 title 和 paragraph_latest_state 的输入 Map
+     * @param searchResult        本轮搜索返回的推理文本
+     * @param nextSearchFocus     Reflection Judge 给出的补充搜索方向（可为 null）
+     * @return 更新后的段落摘要内容
+     */
+    private String generateReflectionSummary(Map<String, String> reflectionInputMap,
+                                              String searchResult,
+                                              String nextSearchFocus) {
+        BeanOutputConverter<UpdatedSummaryResult> converter =
+                new BeanOutputConverter<>(UpdatedSummaryResult.class);
+
+        String basePrompt = new PromptTemplate(DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION_SUMMARY)
+                .create(Map.of(
+                        "input_schema", toJson(reflectionInputMap),
+                        "output_schema", converter.getFormat()
+                ))
+                .getContents();
+
+        // 如果 Reflection Judge 提供了补充方向，追加在 Prompt 末尾作为约束
+        String augmentedPrompt = basePrompt;
+        if (nextSearchFocus != null && !nextSearchFocus.isBlank()) {
+            augmentedPrompt = basePrompt + "\n\n**[Reflection Agent 补充指导]** 在合并和丰富段落内容时，请特别关注以下方向：\n" + nextSearchFocus;
+            logger.debug("[AbstractAgent] 注入 Reflection Judge 搜索方向约束: {}", nextSearchFocus);
+        }
+
+        String finalPrompt = augmentedPrompt + "\n\n以下是搜索结果：\n" + searchResult;
+
+        String jsonResponse;
+        try {
+            jsonResponse = chatClient.call(
+                    new org.springframework.ai.chat.prompt.Prompt(finalPrompt)
+            ).getResult().getOutput().getContent();
+        } catch (Exception e) {
+            logger.error("generateReflectionSummary LLM call failed", e);
+            return "";
+        }
+
+        if (jsonResponse == null) return "";
+
+        try {
+            UpdatedSummaryResult result = converter.convert(jsonResponse);
+            return result.updated_paragraph_latest_state();
+        } catch (Exception e) {
+            logger.warn("generateReflectionSummary BeanOutputConverter failed, falling back: {}", e.getMessage());
+            String extracted = extractContentFromJson(jsonResponse);
+            return extracted != null ? extracted : "";
+        }
     }
 
     private String extractContentFromJson(String json) {
