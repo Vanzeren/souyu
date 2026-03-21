@@ -93,16 +93,32 @@ public abstract class AbstractAgent<R> {
             State currentState = stateManager.getState(taskId);
             int totalParagraphs = currentState.getParagraphs().size();
 
+            // 使用虚拟线程并发处理各文段
+            List<Thread> virtualThreads = new ArrayList<>();
             for (int i = 0; i < totalParagraphs; i++) {
-                checkIfCancelled(taskId);
-                try {
-                    processParagraph(taskId, i);
-                    taskStatusManager.refreshUpdateTime(taskId);
-                } catch (Exception e) {
-                    if (e instanceof RuntimeException && "Task cancelled".equals(e.getMessage())) {
-                        throw e;
+                final int paragraphIndex = i;
+                Thread vThread = Thread.ofVirtual().name("paragraph-" + (i + 1)).start(() -> {
+                    try {
+                        checkIfCancelled(taskId);
+                        processParagraph(taskId, paragraphIndex);
+                        taskStatusManager.refreshUpdateTime(taskId);
+                    } catch (Exception e) {
+                        if (e instanceof RuntimeException && "Task cancelled".equals(e.getMessage())) {
+                            throw (RuntimeException) e;
+                        }
+                        logger.error("处理段落 {} 失败: {}", paragraphIndex + 1, e.getMessage(), e);
                     }
-                    logger.error("处理段落 {} 失败: {}", i + 1, e.getMessage(), e);
+                });
+                virtualThreads.add(vThread);
+            }
+
+            // 等待所有虚拟线程完成
+            for (Thread vThread : virtualThreads) {
+                try {
+                    vThread.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logger.warn("等待段落处理被中断");
                 }
             }
 
@@ -137,6 +153,8 @@ public abstract class AbstractAgent<R> {
                 producer.sendMessage("task:events:stream", event);
             }
         } finally {
+            // 强制刷盘最后一次心跳，确保数据持久化
+            taskStatusManager.refreshUpdateTimeImmediately(taskId);
             taskControlManager.clearTask(taskId);
         }
     }
