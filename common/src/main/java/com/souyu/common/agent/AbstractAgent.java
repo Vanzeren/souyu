@@ -278,12 +278,9 @@ public abstract class AbstractAgent<R> {
                     shouldContinue = reflectionResponse.shouldContinue();
                     nextSearchFocus = reflectionResponse.nextSearchFocus();
 
-                    // 2. 检查早停
+                    // 记录早停建议，但先不退出，继续执行本轮搜索和生成
                     if (!shouldContinue) {
-                        logger.info("  [Reflection Judge] 段落 {} 质量达标，提前结束反思循环", paragraphIndex + 1);
-                        // 发送最终摘要
-                        producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
-                        break;
+                        logger.info("  [Reflection Judge] 段落 {} 质量达标，本轮搜索后结束", paragraphIndex + 1);
                     }
 
                 } catch (Exception e) {
@@ -294,7 +291,7 @@ public abstract class AbstractAgent<R> {
                 }
             }
 
-            // 3. 执行搜索（带评判建议指导）
+            // 2. 执行搜索（带评判建议指导）
             String reflectionPrompt = new PromptTemplate(DeepSearchPrompts.SYSTEM_PROMPT_REFLECTION)
                     .create(Map.of(
                             "input_schema", toJson(reflectionInputMap),
@@ -305,22 +302,28 @@ public abstract class AbstractAgent<R> {
             String reflectionSearchResult;
             if (nextSearchFocus != null && !nextSearchFocus.isBlank()) {
                 // 用 nextSearchFocus 增强搜索 Prompt
-                reflectionSearchResult = performSearchWithFocus(taskId, paragraphSnapshot, reflectionPrompt, nextSearchFocus);
                 logger.info("  [Reflection Search] 使用建议指导: {}", nextSearchFocus.substring(0, Math.min(50, nextSearchFocus.length())));
+                reflectionSearchResult = performSearchWithFocus(taskId, paragraphSnapshot, reflectionPrompt, nextSearchFocus);
             } else {
                 reflectionSearchResult = performSearch(taskId, paragraphSnapshot, reflectionPrompt);
             }
             captureSearchResults(taskId, paragraphIndex, "Reflection Search " + (i + 1));
 
-            // 4. 生成新摘要
+            // 3. 生成新摘要
             String updatedSummaryContent = generateReflectionSummary(
-                    reflectionInputMap, reflectionSearchResult, null); // nextSearchFocus 已在搜索阶段使用
+                    reflectionInputMap, reflectionSearchResult, null);
             String safeUpdatedSummaryContent = updatedSummaryContent != null ? updatedSummaryContent : "";
             currentSummary = safeUpdatedSummaryContent;
             updateParagraphSummary(taskId, paragraphIndex, currentSummary);
 
             // 每轮结束都发送更新（便于前端实时查看）
             producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+
+            // 4. 检查早停：搜索和生成完成后，再决定是否退出循环
+            if (!shouldContinue) {
+                logger.info("  [Reflection Judge] 段落 {} 反思循环结束", paragraphIndex + 1);
+                break;
+            }
         }
 
         stateManager.executeUpdate(taskId, s -> s.getParagraph(paragraphIndex).getResearch().markCompleted());

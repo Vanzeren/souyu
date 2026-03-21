@@ -118,7 +118,6 @@ public final class ReflectionJudgePrompt {
             当满足以下任意条件时，**shouldContinue 必须为 false（早停）**：
             - 综合得分 >= {quality_threshold}
             - 当前已是最后一轮（reflectionRound >= maxReflections - 1）
-            - 识别到的知识缺口为空 且 综合得分 >= 0.6
 
             请严格按照以下 JSON Schema 格式输出，不要输出任何额外文字：
 
