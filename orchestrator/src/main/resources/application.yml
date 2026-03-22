@@ -29,6 +29,14 @@ app:
 orchestrator:
   worker-count: 2
 
+# Forum-Engine 健康检查配置
+forum:
+  health-check:
+    enabled: true
+    interval-ms: 10000  # 每10秒扫描一次
+  failover:
+    enabled: true  # 启用故障转移管理器
+
 # Placeholder for common module dependencies
 bocha:
   api-key: ${BOCHA_API_KEY:placeholder}

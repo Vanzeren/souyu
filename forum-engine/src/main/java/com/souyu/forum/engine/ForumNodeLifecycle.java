@@ -1,7 +1,6 @@
 package com.souyu.forum.engine;
 
 import com.souyu.common.forum.ForumConstants;
-import com.souyu.common.forum.ForumSlotManager;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
@@ -12,9 +11,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.net.InetAddress;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -38,9 +35,6 @@ public class ForumNodeLifecycle {
     @Value("${server.port:8083}")
     private int port;
 
-    @Value("${forum.node.capacity:20}")
-    private int capacity;
-
     @Value("${forum.node.id:}")
     private String configuredNodeId;
 
@@ -48,9 +42,6 @@ public class ForumNodeLifecycle {
     private String host;
     private volatile boolean running = true;
     private ScheduledExecutorService heartbeatExecutor;
-
-    @Autowired
-    private ForumSlotManager slotManager;
 
     @PostConstruct
     public void init() {
@@ -63,36 +54,10 @@ public class ForumNodeLifecycle {
         // 注册节点
         registerNode();
 
-        // 启动心跳
+        // 启动心跳（简化版：只发送，不检测）
         startHeartbeat();
 
-        // 初始化槽位分配（如果是第一个节点）
-        initializeSlotsIfNeeded();
-
-        log.info("Forum node {} started at {}:{}, capacity: {}",
-                nodeId, host, port, capacity);
-    }
-
-    /**
-     * 如果槽位分配未初始化，则进行初始化
-     */
-    private void initializeSlotsIfNeeded() {
-        try {
-            // 检查是否已有槽位分配
-            Map<Integer, String> allocations = slotManager.getAllSlotAllocations();
-            if (allocations.isEmpty()) {
-                log.info("Slot allocation not initialized, initializing...");
-                // 获取所有健康节点（包括自己）
-                List<String> healthyNodes = new ArrayList<>();
-                healthyNodes.add(nodeId);
-                slotManager.initializeSlotAllocation(healthyNodes);
-                log.info("Slot allocation initialized for node: {}", nodeId);
-            } else {
-                log.info("Slot allocation already initialized, {} slots assigned", allocations.size());
-            }
-        } catch (Exception e) {
-            log.warn("Failed to initialize slots: {}", e.getMessage());
-        }
+        log.info("Forum node {} started at {}:{}", nodeId, host, port);
     }
 
     /**
@@ -133,9 +98,6 @@ public class ForumNodeLifecycle {
         nodeInfo.put("nodeId", nodeId);
         nodeInfo.put("host", host);
         nodeInfo.put("port", String.valueOf(port));
-        nodeInfo.put("load", "0");
-        nodeInfo.put("capacity", String.valueOf(capacity));
-        nodeInfo.put("region", "default");
         nodeInfo.put("lastHeartbeat", String.valueOf(System.currentTimeMillis()));
 
         redisTemplate.opsForHash().putAll(key, nodeInfo);
@@ -149,7 +111,9 @@ public class ForumNodeLifecycle {
     }
 
     /**
-     * 启动心跳线程
+     * 启动心跳（简化版：只更新自己的心跳时间和TTL）
+     *
+     * 注意：不做任何检测操作，检测由外部系统（Orchestrator）负责
      */
     private void startHeartbeat() {
         heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -159,53 +123,26 @@ public class ForumNodeLifecycle {
         });
 
         heartbeatExecutor.scheduleAtFixedRate(() -> {
-            try {
-                if (!running) {
-                    return;
-                }
+            if (!running) {
+                return;
+            }
 
+            try {
                 String key = ForumConstants.KEY_NODE_PREFIX + nodeId;
 
-                // 检查节点 key 是否存在（可能被故障转移清理）
-                Boolean exists = redisTemplate.hasKey(key);
-                if (!Boolean.TRUE.equals(exists)) {
-                    log.warn("Node key disappeared, re-registering...");
-                    registerNode();
-                    return;
-                }
-
-                // 更新心跳时间
+                // 只更新自己的心跳时间戳和续期 TTL
+                // 不检查 Key 是否存在（由外部检测）
+                // 不更新负载信息（降低 Redis 压力）
                 redisTemplate.opsForHash().put(key, "lastHeartbeat",
                         String.valueOf(System.currentTimeMillis()));
-
-                // 刷新负载信息
-                updateLoadInfo();
-
-                // 续租 TTL
                 redisTemplate.expire(key, ForumConstants.NODE_TTL_SECONDS, TimeUnit.SECONDS);
 
                 log.debug("Heartbeat sent for node {}", nodeId);
 
             } catch (Exception e) {
-                log.error("Failed to send heartbeat", e);
+                log.error("Failed to send heartbeat: {}", e.getMessage());
             }
         }, 5, 5, TimeUnit.SECONDS);  // 每5秒心跳，TTL 15秒（3个周期）
-    }
-
-    /**
-     * 更新负载信息
-     */
-    private void updateLoadInfo() {
-        try {
-            String tasksKey = String.format(ForumConstants.KEY_NODE_TASKS, nodeId);
-            Long taskCount = redisTemplate.opsForSet().size(tasksKey);
-
-            String key = ForumConstants.KEY_NODE_PREFIX + nodeId;
-            redisTemplate.opsForHash().put(key, "load",
-                    String.valueOf(taskCount != null ? taskCount : 0));
-        } catch (Exception e) {
-            log.warn("Failed to update load info", e);
-        }
     }
 
     /**
@@ -227,34 +164,6 @@ public class ForumNodeLifecycle {
      */
     public int getPort() {
         return port;
-    }
-
-    /**
-     * 获取当前负载
-     */
-    public int getCurrentLoad() {
-        try {
-            String tasksKey = String.format(ForumConstants.KEY_NODE_TASKS, nodeId);
-            Long count = redisTemplate.opsForSet().size(tasksKey);
-            return count != null ? count.intValue() : 0;
-        } catch (Exception e) {
-            log.warn("Failed to get current load", e);
-            return 0;
-        }
-    }
-
-    /**
-     * 获取容量
-     */
-    public int getCapacity() {
-        return capacity;
-    }
-
-    /**
-     * 是否有可用容量
-     */
-    public boolean hasCapacity() {
-        return getCurrentLoad() < capacity;
     }
 
     /**

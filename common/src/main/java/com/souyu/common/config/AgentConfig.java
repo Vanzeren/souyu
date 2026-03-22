@@ -11,7 +11,7 @@ public class AgentConfig {
     public static class SearchConfig {
         private int timeout = 240;
         private int contentMaxLength = 20000;
-        private int maxReflections = 2;
+        private int maxReflections = 3;
         private int maxParagraphs = 5;
         private int maxResults = 20;
     }

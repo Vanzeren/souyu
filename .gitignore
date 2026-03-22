@@ -18,11 +18,10 @@ mvnw.cmd
 logs/
 *.log
 
+docs/
 # OS specific
 .DS_Store
 Thumbs.db
-FORUM_IMPLEMENTATION_TODO.md
-FORUM_STREAM_DESIGN.md
 
 # Configuration files (sensitive data)
 **/application.yml

@@ -73,6 +73,16 @@ public class ReflectionServiceImpl implements ReflectionService {
         log.info("[ReflectionService] 开始评判 taskId={} 段落='{}' 轮次={}/{}",
                 request.taskId(), request.paragraphTitle(),
                 request.reflectionRound() + 1, request.maxReflections());
+
+        // 【提前判断】如果已是最后一轮，直接返回早停，避免浪费搜索和 LLM 资源
+        if (request.reflectionRound() >= request.maxReflections() - 1) {
+            log.info("[ReflectionService] 已达最大轮次{}，直接早停: taskId={}",
+                    request.maxReflections(), request.taskId());
+            return new ReflectionResponse(
+                    false, 0.0, List.of(), null, "已达最大反思轮次，停止继续搜索"
+            );
+        }
+
         log.info("[ReflectionService] AbstractAgent 使用 {}, Reflection 将使用 {} 进行补充验证",
                 request.agentSearchEngine(), request.getReflectionSearchEngine());
 
@@ -224,6 +234,7 @@ public class ReflectionServiceImpl implements ReflectionService {
 
     /**
      * 处理 LLM 评判结果，应用早停逻辑。
+     * 注意：次数判断已在 evaluate() 方法入口处提前处理，此处只处理质量分达标的情况
      */
     private ReflectionResponse processJudgeResult(JudgeResult judgeResult,
                                                    ReflectionRequest request,
@@ -231,6 +242,7 @@ public class ReflectionServiceImpl implements ReflectionService {
         boolean shouldContinue = judgeResult.shouldContinue();
         String stopReason = null;
 
+        // 质量分达标早停
         if (judgeResult.qualityScore() >= qualityThreshold) {
             shouldContinue = false;
             stopReason = "质量分达标";
@@ -238,12 +250,7 @@ public class ReflectionServiceImpl implements ReflectionService {
                     String.format("%.2f", judgeResult.qualityScore()),
                     qualityThreshold, request.taskId());
         }
-        if (request.reflectionRound() >= request.maxReflections() - 1) {
-            shouldContinue = false;
-            stopReason = "已达最大轮次";
-            log.info("[ReflectionService] 已达最大轮次{}，强制早停: taskId={}",
-                    request.maxReflections(), request.taskId());
-        }
+        // 注意：最大轮次判断已在 evaluate() 入口处提前处理，避免浪费搜索和 LLM 资源
 
         long totalDuration = System.currentTimeMillis() - startTime;
         log.info("[ReflectionService] 评判完成: taskId={}, 总分={:.2f}, 早停={}, 原因={}, 总耗时={}ms",
