@@ -20,6 +20,7 @@ import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -33,6 +34,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 @Component
+@ConditionalOnProperty(name = "forum.legacy-consumer.enabled", havingValue = "true", matchIfMissing = false)
 public class consumer implements InitializingBean, DisposableBean {
 
     private static final Logger logger = LoggerFactory.getLogger(consumer.class);

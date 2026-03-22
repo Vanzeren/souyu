@@ -14,6 +14,7 @@ import com.souyu.common.manager.TaskControlManager;
 import com.souyu.common.manager.TaskStatusManager;
 import com.souyu.common.node.querynode.QueryFormattingNode;
 import com.souyu.common.node.querynode.ReportStructureNode;
+import com.souyu.common.forum.DualWriteMessageService;
 import com.souyu.common.producer.messageProducer;
 import com.souyu.common.state.Paragraph;
 import com.souyu.common.state.Search;
@@ -67,6 +68,9 @@ public abstract class AbstractAgent<R> {
 
     @Autowired
     private messageProducer producer;
+
+    @Autowired
+    private DualWriteMessageService dualWriteMessageService;
 
     /**
      * Feign client for the reflection-engine microservice.
@@ -221,7 +225,7 @@ public abstract class AbstractAgent<R> {
         
         // 修复 NPE: 确保 content 不为 null
         String safeFirstSummaryContent = firstSummaryContent != null ? firstSummaryContent : "";
-        producer.sendMessage("forum", Map.of("taskId", taskId, "content", safeFirstSummaryContent, "engine", engineName()));
+        dualWriteMessageService.sendContent(taskId, safeFirstSummaryContent, engineName());
 
         // 3. 反思循环（评判-指导搜索 闭环）
         String currentSummary = safeFirstSummaryContent;
@@ -317,7 +321,7 @@ public abstract class AbstractAgent<R> {
             updateParagraphSummary(taskId, paragraphIndex, currentSummary);
 
             // 每轮结束都发送更新（便于前端实时查看）
-            producer.sendMessage("forum", Map.of("taskId", taskId, "content", currentSummary, "engine", engineName()));
+            dualWriteMessageService.sendContent(taskId, currentSummary, engineName());
 
             // 4. 检查早停：搜索和生成完成后，再决定是否退出循环
             if (!shouldContinue) {
