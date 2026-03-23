@@ -22,5 +22,10 @@ public enum MessageType {
     /**
      * 完成消息 - 任务完成通知
      */
-    COMPLETE
+    COMPLETE,
+
+    /**
+     * 最终检查指令 - 来自 Orchestrator 的总结请求
+     */
+    FINAL_CHECK
 }

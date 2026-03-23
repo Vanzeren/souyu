@@ -38,6 +38,9 @@ public class ForumNodeLifecycle {
     @Value("${forum.node.id:}")
     private String configuredNodeId;
 
+    @Value("${forum.node.capacity:20}")
+    private int capacity;
+
     private String nodeId;
     private String host;
     private volatile boolean running = true;
@@ -98,6 +101,8 @@ public class ForumNodeLifecycle {
         nodeInfo.put("nodeId", nodeId);
         nodeInfo.put("host", host);
         nodeInfo.put("port", String.valueOf(port));
+        nodeInfo.put("capacity", String.valueOf(capacity));
+        nodeInfo.put("load", "0");
         nodeInfo.put("lastHeartbeat", String.valueOf(System.currentTimeMillis()));
 
         redisTemplate.opsForHash().putAll(key, nodeInfo);
@@ -164,6 +169,13 @@ public class ForumNodeLifecycle {
      */
     public int getPort() {
         return port;
+    }
+
+    /**
+     * 获取容量
+     */
+    public int getCapacity() {
+        return capacity;
     }
 
     /**

@@ -46,6 +46,7 @@ public class ForumMessageHandler {
     private report reportService;
 
     private static final String COUNTER_KEY_PREFIX = "log:counter:";
+    private static final String FINAL_CHECK_KEY_PREFIX = "forum:final:check:";
     private static final int SUMMARY_THRESHOLD = 5;
 
     /**
@@ -69,7 +70,7 @@ public class ForumMessageHandler {
             case CONTENT -> handleContentMessage(taskId, message);
             case STATUS -> handleStatusMessage(taskId, message);
             case ERROR -> handleErrorMessage(taskId, message);
-            case COMPLETE -> handleCompleteMessage(taskId, message);
+            case COMPLETE, FINAL_CHECK -> handleCompleteMessage(taskId, message);
             default -> log.warn("Unhandled message type: {}", type);
         }
     }
@@ -79,8 +80,10 @@ public class ForumMessageHandler {
      */
     private void handleContentMessage(String taskId, Map<Object, Object> message) {
         String content = message.get("content") != null ? message.get("content").toString() : "";
+        // 兼容两种字段名：sourceEngine (新) 和 engine (旧)
         String sourceEngine = message.get("sourceEngine") != null ?
-                message.get("sourceEngine").toString() : "unknown";
+                message.get("sourceEngine").toString() :
+                (message.get("engine") != null ? message.get("engine").toString() : "unknown");
 
         log.debug("Handling content message for task {} from {}", taskId, sourceEngine);
 
@@ -133,10 +136,29 @@ public class ForumMessageHandler {
      * 处理完成消息
      */
     private void handleCompleteMessage(String taskId, Map<Object, Object> message) {
+        // 兼容两种字段名：sourceEngine (新) 和 engine (旧)
         String sourceEngine = message.get("sourceEngine") != null ?
-                message.get("sourceEngine").toString() : "unknown";
+                message.get("sourceEngine").toString() :
+                (message.get("engine") != null ? message.get("engine").toString() : "unknown");
 
         log.info("Received complete message for task {} from {}", taskId, sourceEngine);
+
+        // 检查是否已处理过最终总结（防止重复处理）
+        String finalCheckKey = FINAL_CHECK_KEY_PREFIX + taskId;
+        Boolean alreadyProcessed = redisTemplate.opsForValue().setIfAbsent(finalCheckKey, "1", 1, TimeUnit.HOURS);
+        if (Boolean.FALSE.equals(alreadyProcessed)) {
+            log.warn("Final check already processed for task {}, skipping", taskId);
+            // 确保发送 FORUM_COMPLETED 事件（以防上次没发送成功）
+            markTaskCompleted(taskId);
+            return;
+        }
+
+        // 检查最后一条是否已经是 HOST（避免重复总结）
+        if (checkLastIsHost(taskId)) {
+            log.info("Last log is already HOST for task {}, skipping summary", taskId);
+            markTaskCompleted(taskId);
+            return;
+        }
 
         // 执行最终总结
         performSummary(taskId, true);
@@ -173,22 +195,12 @@ public class ForumMessageHandler {
      */
     private void performSummary(String taskId, boolean isFinal) {
         try {
-            // 检查最后一条是否已经是 HOST（避免重复总结）
-            if (checkLastIsHost(taskId)) {
-                log.info("Last log is already HOST for task {}, skipping summary", taskId);
-                if (isFinal) {
-                    markTaskCompleted(taskId);
-                }
-                return;
-            }
-
             log.info("Performing {} summary for task: {}", isFinal ? "final" : "intermediate", taskId);
 
             // 更新状态为 RUNNING
             taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.RUNNING);
 
-            // TODO: 调用总结服务生成总结内容
-            // 这里复用现有的总结逻辑
+            // 调用总结服务生成总结内容
             String summary = generateSummary(taskId);
 
             if (summary != null && !summary.isEmpty()) {
@@ -264,15 +276,29 @@ public class ForumMessageHandler {
      * 标记任务完成
      */
     private void markTaskCompleted(String taskId) {
+        boolean eventSent = false;
         try {
-            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+            // 先发送事件通知 Orchestrator（最重要）
             producer.triggerForumCompleted(taskId);
-            log.info("Task {} marked as COMPLETED", taskId);
+            eventSent = true;
+            log.info("FORUM_COMPLETED event sent for task {}", taskId);
+        } catch (Exception e) {
+            log.error("Failed to send FORUM_COMPLETED event for task {}", taskId, e);
+        }
 
+        try {
+            // 更新状态
+            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+            log.info("Task {} forum status updated to COMPLETED", taskId);
+        } catch (Exception e) {
+            log.error("Failed to update forum status for task {}", taskId, e);
+        }
+
+        try {
             // 清理计数器
             redisTemplate.delete(COUNTER_KEY_PREFIX + taskId);
         } catch (Exception e) {
-            log.error("Failed to mark task {} as completed", taskId, e);
+            log.warn("Failed to clean up counter for task {}", taskId, e);
         }
     }
 

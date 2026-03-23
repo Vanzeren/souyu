@@ -58,6 +58,7 @@ public class consumer implements InitializingBean, DisposableBean {
     private messageProducer producer; // 注入消息生产者
 
     private final String LOCK_PREFIX="souyu:forum:lock:";
+    private final String FINAL_CHECK_KEY_PREFIX = "forum:final:check:";
     private final String streamKey = "forum";
     private final String groupName = "forum-consumer";
 
@@ -168,7 +169,10 @@ public class consumer implements InitializingBean, DisposableBean {
             // 安全地转换为 String
             String taskId = body.get("taskId") != null ? body.get("taskId").toString() : null;
             String content = body.get("content") != null ? body.get("content").toString() : null;
-            String engine = body.get("engine") != null ? body.get("engine").toString() : "unknown";
+            // 兼容两种字段名：sourceEngine (新) 和 engine (旧)
+            String engine = body.get("sourceEngine") != null ?
+                    body.get("sourceEngine").toString() :
+                    (body.get("engine") != null ? body.get("engine").toString() : "unknown");
             String type = body.get("type") != null ? body.get("type").toString() : null;
 
             if (taskId == null) {
@@ -232,6 +236,16 @@ public class consumer implements InitializingBean, DisposableBean {
      * 执行最终检查 (响应 Master 的 FINAL_CHECK)
      */
     private void performFinalCheck(String taskId) {
+        // 检查是否已处理过最终总结（防止重复处理）
+        String finalCheckKey = FINAL_CHECK_KEY_PREFIX + taskId;
+        Boolean alreadyProcessed = redisTemplate.opsForValue().setIfAbsent(finalCheckKey, "1", 1, TimeUnit.HOURS);
+        if (Boolean.FALSE.equals(alreadyProcessed)) {
+            logger.warn("Final check already processed for task {}, skipping", taskId);
+            // 确保发送 FORUM_COMPLETED 事件（以防上次没发送成功）
+            sendForumCompletedEvent(taskId);
+            return;
+        }
+
         RLock taskLock = redissonClient.getLock("souyu:forum:tasklock:" + taskId);
         try {
             if (taskLock.tryLock(5, 60, TimeUnit.SECONDS)) {
@@ -242,8 +256,7 @@ public class consumer implements InitializingBean, DisposableBean {
                     } else {
                         logger.info("Final check: Last log is already HOST, marking as COMPLETED for task: {}", taskId);
                         // 即使已经是 HOST，也要确保状态是 COMPLETED 并发送事件，以防万一
-                        taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                        producer.triggerForumCompleted(taskId); // 使用新方法
+                        sendForumCompletedEvent(taskId);
                     }
                 } finally {
                     taskLock.unlock();
@@ -273,12 +286,9 @@ public class consumer implements InitializingBean, DisposableBean {
                 
                 if (isFinal) {
                     // 只有最终总结才更新为 COMPLETED 并发送事件
-                    taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                    producer.triggerForumCompleted(taskId); // 使用新方法
+                    sendForumCompletedEvent(taskId);
                 } else {
-                    // 阶段性总结，状态可以保持 RUNNING 或者改回 PENDING，这里保持 RUNNING 即可
-                    // 或者不更新状态，因为 TaskStatusManager 默认没有 PENDING -> RUNNING -> PENDING 的流转
-                    // 简单起见，我们不更新为 COMPLETED
+                    // 阶段性总结，状态可以保持 RUNNING
                     logger.info("Intermediate summary generated for task: {}", taskId);
                 }
             } else {
@@ -287,9 +297,30 @@ public class consumer implements InitializingBean, DisposableBean {
         } else {
             logger.info("Last log is already HOST, skipping summary generation for task: {}", taskId);
             if (isFinal) {
-                 taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
-                 producer.triggerForumCompleted(taskId); // 使用新方法
+                 sendForumCompletedEvent(taskId);
             }
+        }
+    }
+
+    /**
+     * 发送 FORUM_COMPLETED 事件并更新状态
+     * 确保事件发送优先，即使状态更新失败也要通知 Orchestrator
+     */
+    private void sendForumCompletedEvent(String taskId) {
+        try {
+            // 先发送事件通知 Orchestrator（最重要）
+            producer.triggerForumCompleted(taskId);
+            logger.info("FORUM_COMPLETED event sent for task {}", taskId);
+        } catch (Exception e) {
+            logger.error("Failed to send FORUM_COMPLETED event for task {}", taskId, e);
+        }
+
+        try {
+            // 更新状态
+            taskStatusManager.updateForumStatus(taskId, TaskStatus.WorkerStatus.COMPLETED);
+            logger.info("Task {} forum status updated to COMPLETED", taskId);
+        } catch (Exception e) {
+            logger.error("Failed to update forum status for task {}", taskId, e);
         }
     }
 

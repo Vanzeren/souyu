@@ -2,6 +2,9 @@ package com.souyu.orchestrator.task;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.souyu.common.TaskStatus.TaskStatus;
+import com.souyu.common.forum.ForumConstants;
+import com.souyu.common.forum.ForumNode;
+import com.souyu.common.forum.ForumServiceRouter;
 import com.souyu.common.manager.ReportDocument;
 import com.souyu.common.manager.StateDocument;
 import com.souyu.common.manager.TaskControlManager;
@@ -53,7 +56,10 @@ public class TaskTimeoutMonitor {
     
     @Autowired
     private RedissonClient redissonClient;
-    
+
+    @Autowired
+    private ForumServiceRouter forumRouter;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
@@ -125,11 +131,7 @@ public class TaskTimeoutMonitor {
                 taskStatusManager.updateMainStatus(task.getTaskId(), TaskStatus.Status.SUMMARIZING);
 
                 // 触发 Forum (下一阶段任务)
-                producer.sendMessage("forum", Map.of(
-                        "taskId", task.getTaskId(),
-                        "type", "FINAL_CHECK",
-                        "engine", "MASTER"
-                ));
+                triggerForumFinalCheck(task.getTaskId());
                 return;
             }
 
@@ -194,11 +196,7 @@ public class TaskTimeoutMonitor {
         logger.warn("Task {} stuck in SUMMARIZING. Retrying FINAL_CHECK (Retry {}/{})", task.getTaskId(), task.getRetryCount() + 1, MAX_RETRIES);
         taskStatusManager.incrementRetryCount(task.getTaskId());
 
-        producer.sendMessage("forum", Map.of(
-                "taskId", task.getTaskId(),
-                "type", "FINAL_CHECK",
-                "engine", "MASTER"
-        ));
+        triggerForumFinalCheck(task.getTaskId());
     }
     
     private void handleGeneratingTimeout(TaskStatus task) {
@@ -260,5 +258,47 @@ public class TaskTimeoutMonitor {
             return content != null ? content : null;
         }
         return null;
+    }
+
+    /**
+     * 触发 Forum 进行最终检查
+     * 使用路由找到正确的节点，发送到该节点的专属 Stream
+     */
+    private void triggerForumFinalCheck(String taskId) {
+        try {
+            // 获取任务绑定的节点
+            ForumNode node = forumRouter.getOrBindNode(taskId);
+            if (node == null) {
+                logger.error("Cannot find forum node for task {}", taskId);
+                return;
+            }
+
+            // 构建节点专属的 Stream Key
+            String streamKey = ForumConstants.KEY_STREAM_PREFIX + node.getNodeId();
+
+            // 发送消息到该节点的专属 Stream
+            producer.sendMessage(streamKey, Map.of(
+                    "taskId", taskId,
+                    "type", "FINAL_CHECK",
+                    "engine", "MASTER"
+            ));
+
+            logger.info("Sent FINAL_CHECK to forum node {} for task {} via stream {}",
+                    node.getNodeId(), taskId, streamKey);
+
+        } catch (Exception e) {
+            logger.error("Failed to trigger forum final check for task {}", taskId, e);
+            // 降级：尝试发送到公共 forum stream（兼容旧架构）
+            try {
+                producer.sendMessage("forum", Map.of(
+                        "taskId", taskId,
+                        "type", "FINAL_CHECK",
+                        "engine", "MASTER"
+                ));
+                logger.warn("Fallback to common forum stream for task {}", taskId);
+            } catch (Exception fallbackEx) {
+                logger.error("Fallback also failed for task {}", taskId, fallbackEx);
+            }
+        }
     }
 }
